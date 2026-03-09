@@ -26,7 +26,7 @@ func newTestBaoServer(t *testing.T, data map[string]interface{}) *httptest.Serve
 			},
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	t.Cleanup(srv.Close)
 	return srv
@@ -96,7 +96,7 @@ func TestOpenBaoProvider_Get_Caching(t *testing.T) {
 			},
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	t.Cleanup(srv.Close)
 
@@ -132,6 +132,33 @@ func TestOpenBaoProvider_GetOrDefault_Fallback(t *testing.T) {
 	assert.Equal(t, "default", val)
 }
 
+func TestOpenBaoProvider_Get_EmptyKey(t *testing.T) {
+	t.Parallel()
+
+	p := secrets.NewOpenBaoProvider("http://localhost:1", "token")
+	_, err := p.Get(context.Background(), "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "empty key")
+}
+
+func TestOpenBaoProvider_Get_EmptyPath(t *testing.T) {
+	t.Parallel()
+
+	p := secrets.NewOpenBaoProvider("http://localhost:1", "token")
+	_, err := p.Get(context.Background(), "#field")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "empty path")
+}
+
+func TestOpenBaoProvider_Get_EmptyField(t *testing.T) {
+	t.Parallel()
+
+	p := secrets.NewOpenBaoProvider("http://localhost:1", "token")
+	_, err := p.Get(context.Background(), "path#")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "empty field")
+}
+
 func TestOpenBaoProvider_WithMount(t *testing.T) {
 	t.Parallel()
 
@@ -144,7 +171,7 @@ func TestOpenBaoProvider_WithMount(t *testing.T) {
 			},
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	t.Cleanup(srv.Close)
 

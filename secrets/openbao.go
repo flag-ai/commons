@@ -7,18 +7,27 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
+)
+
+const (
+	defaultCacheTTL    = 5 * time.Minute
+	maxErrorBodyBytes  = 4096
+	defaultMount       = "kv"
+	defaultHTTPTimeout = 10 * time.Second
 )
 
 // OpenBaoProvider retrieves secrets from an OpenBao (Vault-compatible) server.
 // It caches secrets in memory and supports token-based authentication.
 type OpenBaoProvider struct {
-	addr   string
-	token  string
-	mount  string
-	client *http.Client
-	logger *slog.Logger
+	addr     string
+	token    string
+	mount    string
+	cacheTTL time.Duration
+	client   *http.Client
+	logger   *slog.Logger
 
 	mu    sync.RWMutex
 	cache map[string]cacheEntry
@@ -53,17 +62,26 @@ func WithMount(mount string) OpenBaoOption {
 	}
 }
 
+// WithCacheTTL sets the cache time-to-live for secrets (default: 5m).
+// Set to 0 to disable caching.
+func WithCacheTTL(ttl time.Duration) OpenBaoOption {
+	return func(p *OpenBaoProvider) {
+		p.cacheTTL = ttl
+	}
+}
+
 // NewOpenBaoProvider creates a new OpenBaoProvider.
 // addr is the OpenBao server address (e.g., "http://localhost:8200").
 // token is the authentication token.
 func NewOpenBaoProvider(addr, token string, opts ...OpenBaoOption) *OpenBaoProvider {
 	p := &OpenBaoProvider{
-		addr:   addr,
-		token:  token,
-		mount:  "kv",
-		client: &http.Client{Timeout: 10 * time.Second},
-		logger: slog.Default(),
-		cache:  make(map[string]cacheEntry),
+		addr:     addr,
+		token:    token,
+		mount:    defaultMount,
+		cacheTTL: defaultCacheTTL,
+		client:   &http.Client{Timeout: defaultHTTPTimeout},
+		logger:   slog.Default(),
+		cache:    make(map[string]cacheEntry),
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -82,7 +100,10 @@ type kvV2Response struct {
 // path is the secret path and field is the key within the secret data.
 // If no field is specified, the "value" field is used.
 func (p *OpenBaoProvider) Get(ctx context.Context, key string) (string, error) {
-	path, field := parseKey(key)
+	path, field, err := parseKey(key)
+	if err != nil {
+		return "", err
+	}
 
 	// Check cache
 	if val, ok := p.fromCache(key); ok {
@@ -94,7 +115,9 @@ func (p *OpenBaoProvider) Get(ctx context.Context, key string) (string, error) {
 		return "", err
 	}
 
-	p.toCache(key, val, 5*time.Minute)
+	if p.cacheTTL > 0 {
+		p.toCache(key, val, p.cacheTTL)
+	}
 	return val, nil
 }
 
@@ -109,9 +132,9 @@ func (p *OpenBaoProvider) GetOrDefault(ctx context.Context, key, defaultVal stri
 }
 
 func (p *OpenBaoProvider) fetchSecret(ctx context.Context, path, field string) (string, error) {
-	url := fmt.Sprintf("%s/v1/%s/data/%s", p.addr, p.mount, path)
+	reqURL := fmt.Sprintf("%s/v1/%s/data/%s", p.addr, p.mount, url.PathEscape(path))
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("secrets: failed to create request: %w", err)
 	}
@@ -121,10 +144,10 @@ func (p *OpenBaoProvider) fetchSecret(ctx context.Context, path, field string) (
 	if err != nil {
 		return "", fmt.Errorf("secrets: openbao request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 		return "", fmt.Errorf("secrets: openbao returned %d: %s", resp.StatusCode, body)
 	}
 
@@ -147,10 +170,14 @@ func (p *OpenBaoProvider) fetchSecret(ctx context.Context, path, field string) (
 }
 
 func (p *OpenBaoProvider) fromCache(key string) (string, bool) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	entry, ok := p.cache[key]
-	if !ok || time.Now().After(entry.expires) {
+	if !ok {
+		return "", false
+	}
+	if time.Now().After(entry.expires) {
+		delete(p.cache, key)
 		return "", false
 	}
 	return entry.value, true
@@ -163,12 +190,22 @@ func (p *OpenBaoProvider) toCache(key, value string, ttl time.Duration) {
 }
 
 // parseKey splits "path#field" into path and field. If no "#" is present,
-// the field defaults to "value".
-func parseKey(key string) (string, string) {
+// the field defaults to "value". Returns an error if path or field is empty.
+func parseKey(key string) (string, string, error) {
 	for i := range key {
 		if key[i] == '#' {
-			return key[:i], key[i+1:]
+			path, field := key[:i], key[i+1:]
+			if path == "" {
+				return "", "", fmt.Errorf("secrets: empty path in key %q", key)
+			}
+			if field == "" {
+				return "", "", fmt.Errorf("secrets: empty field in key %q", key)
+			}
+			return path, field, nil
 		}
 	}
-	return key, "value"
+	if key == "" {
+		return "", "", fmt.Errorf("secrets: empty key")
+	}
+	return key, "value", nil
 }

@@ -9,6 +9,7 @@ import (
 // ProviderType identifies a secrets backend.
 type ProviderType string
 
+// Supported secrets provider types.
 const (
 	ProviderEnv     ProviderType = "env"
 	ProviderOpenBao ProviderType = "openbao"

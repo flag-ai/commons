@@ -3,7 +3,6 @@ package health
 
 import (
 	"context"
-	"time"
 
 	"github.com/flag-ai/commons/version"
 )
@@ -19,17 +18,17 @@ type Checker interface {
 
 // Status represents the result of a single health check.
 type Status struct {
-	Name    string        `json:"name"`
-	Healthy bool          `json:"healthy"`
-	Error   string        `json:"error,omitempty"`
-	Latency time.Duration `json:"latency_ms"`
+	Name      string `json:"name"`
+	Healthy   bool   `json:"healthy"`
+	Error     string `json:"error,omitempty"`
+	LatencyMs int64  `json:"latency_ms"`
 }
 
 // Report is the aggregate health check response.
 type Report struct {
-	Healthy  bool     `json:"healthy"`
-	Version  string   `json:"version"`
-	Checks   []Status `json:"checks"`
+	Healthy bool     `json:"healthy"`
+	Version string   `json:"version"`
+	Checks  []Status `json:"checks"`
 }
 
 // NewReport creates a Report with version info pre-populated.
@@ -37,5 +36,6 @@ func NewReport() *Report {
 	return &Report{
 		Healthy: true,
 		Version: version.Info(),
+		Checks:  []Status{},
 	}
 }

@@ -13,9 +13,9 @@ func SetEnv(t *testing.T, key, value string) {
 	t.Setenv(key, value)
 	t.Cleanup(func() {
 		if existed {
-			os.Setenv(key, prev)
+			_ = os.Setenv(key, prev)
 		} else {
-			os.Unsetenv(key)
+			_ = os.Unsetenv(key)
 		}
 	})
 }
@@ -24,10 +24,10 @@ func SetEnv(t *testing.T, key, value string) {
 func UnsetEnv(t *testing.T, key string) {
 	t.Helper()
 	prev, existed := os.LookupEnv(key)
-	os.Unsetenv(key)
+	_ = os.Unsetenv(key)
 	t.Cleanup(func() {
 		if existed {
-			os.Setenv(key, prev)
+			_ = os.Setenv(key, prev)
 		}
 	})
 }

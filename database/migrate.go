@@ -17,7 +17,17 @@ func RunMigrations(sourcePath, dbURL string, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("database: failed to create migrator: %w", err)
 	}
-	defer m.Close()
+	defer func() {
+		srcErr, dbErr := m.Close()
+		if logger != nil {
+			if srcErr != nil {
+				logger.Warn("failed to close migration source", "error", srcErr)
+			}
+			if dbErr != nil {
+				logger.Warn("failed to close migration database", "error", dbErr)
+			}
+		}
+	}()
 
 	if logger != nil {
 		logger.Info("running database migrations", "source", sourcePath)
@@ -27,9 +37,13 @@ func RunMigrations(sourcePath, dbURL string, logger *slog.Logger) error {
 		return fmt.Errorf("database: migration failed: %w", err)
 	}
 
-	ver, dirty, _ := m.Version()
+	ver, dirty, verErr := m.Version()
 	if logger != nil {
-		logger.Info("migrations complete", "version", ver, "dirty", dirty)
+		if verErr != nil {
+			logger.Warn("could not read migration version", "error", verErr)
+		} else {
+			logger.Info("migrations complete", "version", ver, "dirty", dirty)
+		}
 	}
 
 	return nil

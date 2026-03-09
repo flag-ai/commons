@@ -39,7 +39,7 @@ func (c *HTTPChecker) Check(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("health: request to %s failed: %w", c.name, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("health: %s returned status %d", c.name, resp.StatusCode)

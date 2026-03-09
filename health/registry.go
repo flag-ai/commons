@@ -49,9 +49,9 @@ func (r *Registry) RunAll(ctx context.Context) *Report {
 			latency := time.Since(start)
 
 			s := Status{
-				Name:    checker.Name(),
-				Healthy: err == nil,
-				Latency: latency,
+				Name:      checker.Name(),
+				Healthy:   err == nil,
+				LatencyMs: latency.Milliseconds(),
 			}
 			if err != nil {
 				s.Error = err.Error()

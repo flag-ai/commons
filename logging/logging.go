@@ -13,6 +13,7 @@ import (
 // Format selects the log output format.
 type Format string
 
+// Log output format constants.
 const (
 	FormatText Format = "text"
 	FormatJSON Format = "json"
