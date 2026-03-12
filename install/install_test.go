@@ -1,6 +1,8 @@
 package install_test
 
 import (
+	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,7 +22,7 @@ func TestScriptHandler_RendersTemplate(t *testing.T) {
 
 	handler := install.ScriptHandler(install.HandlerConfig{
 		GenerateToken: func(_ *http.Request) (string, error) {
-			return "test-token-abc", nil
+			return "testtokenabc123", nil
 		},
 		ServerURL: func(_ *http.Request) string {
 			return "https://karr.example.com"
@@ -29,7 +31,7 @@ func TestScriptHandler_RendersTemplate(t *testing.T) {
 		Port:       7777,
 	})
 
-	req := httptest.NewRequest(http.MethodGet, "/install.sh?token=test-token-abc", nil)
+	req := httptest.NewRequest(http.MethodGet, "/install.sh?token=testtokenabc123", nil)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
@@ -39,7 +41,7 @@ func TestScriptHandler_RendersTemplate(t *testing.T) {
 	body := rec.Body.String()
 	assert.Contains(t, body, `REPO="flag-ai/bonnie"`)
 	assert.Contains(t, body, `SERVER_URL="https://karr.example.com"`)
-	assert.Contains(t, body, `REGISTRATION_TOKEN="test-token-abc"`)
+	assert.Contains(t, body, `REGISTRATION_TOKEN="testtokenabc123"`)
 	assert.Contains(t, body, `PORT="7777"`)
 	assert.Contains(t, body, "#!/usr/bin/env bash")
 }
@@ -49,7 +51,7 @@ func TestScriptHandler_Defaults(t *testing.T) {
 
 	handler := install.ScriptHandler(install.HandlerConfig{
 		GenerateToken: func(_ *http.Request) (string, error) {
-			return "tok", nil
+			return "tok123", nil
 		},
 	})
 
@@ -60,10 +62,8 @@ func TestScriptHandler_Defaults(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, rec.Code)
 	body := rec.Body.String()
-	// Defaults: BinaryRepo=flag-ai/bonnie, Port=7777
 	assert.Contains(t, body, `REPO="flag-ai/bonnie"`)
 	assert.Contains(t, body, `PORT="7777"`)
-	// Auto-detected server URL from Host header
 	assert.Contains(t, body, `SERVER_URL="http://karr.internal:8080"`)
 }
 
@@ -72,13 +72,52 @@ func TestScriptHandler_XForwardedProto(t *testing.T) {
 
 	handler := install.ScriptHandler(install.HandlerConfig{
 		GenerateToken: func(_ *http.Request) (string, error) {
-			return "tok", nil
+			return "tok123", nil
 		},
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/install.sh", nil)
 	req.Host = "karr.example.com"
 	req.Header.Set("X-Forwarded-Proto", "https")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), `SERVER_URL="https://karr.example.com"`)
+}
+
+func TestScriptHandler_XForwardedProtoInvalid(t *testing.T) {
+	t.Parallel()
+
+	handler := install.ScriptHandler(install.HandlerConfig{
+		GenerateToken: func(_ *http.Request) (string, error) {
+			return "tok123", nil
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/install.sh", nil)
+	req.Host = "karr.example.com"
+	req.Header.Set("X-Forwarded-Proto", "ftp")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	// Invalid proto should fall back to "http"
+	assert.Contains(t, rec.Body.String(), `SERVER_URL="http://karr.example.com"`)
+}
+
+func TestScriptHandler_TLSDetection(t *testing.T) {
+	t.Parallel()
+
+	handler := install.ScriptHandler(install.HandlerConfig{
+		GenerateToken: func(_ *http.Request) (string, error) {
+			return "tok123", nil
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/install.sh", nil)
+	req.Host = "karr.example.com"
+	req.TLS = &tls.ConnectionState{}
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
@@ -103,23 +142,55 @@ func TestScriptHandler_TokenError(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), "invalid or expired token")
 }
 
+func TestScriptHandler_TokenWithShellMetachars(t *testing.T) {
+	t.Parallel()
+
+	handler := install.ScriptHandler(install.HandlerConfig{
+		GenerateToken: func(_ *http.Request) (string, error) {
+			return `"; rm -rf / #`, nil
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/install.sh", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "invalid token format")
+}
+
+func TestScriptHandler_NilGenerateToken(t *testing.T) {
+	t.Parallel()
+
+	handler := install.ScriptHandler(install.HandlerConfig{})
+
+	req := httptest.NewRequest(http.MethodGet, "/install.sh", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
 func TestRegisterHandler_Success(t *testing.T) {
 	t.Parallel()
 
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-
-	handler := install.RegisterHandler(func(req install.RegisterRequest, sourceIP string) (install.RegisterResult, error) {
-		assert.Equal(t, "reg-token-123", req.RegistrationToken)
+	handler := install.RegisterHandler(func(ctx context.Context, req install.RegisterRequest, sourceIP string) (install.RegisterResult, error) {
+		assert.NotNil(t, ctx)
+		assert.Equal(t, "regtok123", req.RegistrationToken)
 		assert.Equal(t, 7777, req.Port)
-		assert.Equal(t, "auth-token-456", req.AuthToken)
+		assert.Equal(t, "authtok456", req.AuthToken)
 		assert.Equal(t, "192.168.1.100", sourceIP)
 		return install.RegisterResult{
 			AgentID: "agent-uuid-789",
 			Message: "agent registered",
 		}, nil
-	}, logger)
+	}, discardLogger())
 
-	body := `{"registration_token":"reg-token-123","port":7777,"auth_token":"auth-token-456"}`
+	body := `{"registration_token":"regtok123","port":7777,"auth_token":"authtok456"}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/register", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.RemoteAddr = "192.168.1.100:54321"
@@ -138,12 +209,10 @@ func TestRegisterHandler_Success(t *testing.T) {
 func TestRegisterHandler_WithAddressOverride(t *testing.T) {
 	t.Parallel()
 
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-
-	handler := install.RegisterHandler(func(req install.RegisterRequest, _ string) (install.RegisterResult, error) {
+	handler := install.RegisterHandler(func(_ context.Context, req install.RegisterRequest, _ string) (install.RegisterResult, error) {
 		assert.Equal(t, "10.0.0.50", req.Address)
 		return install.RegisterResult{AgentID: "id"}, nil
-	}, logger)
+	}, discardLogger())
 
 	body := `{"registration_token":"tok","port":7777,"auth_token":"auth","address":"10.0.0.50"}`
 	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(body))
@@ -157,13 +226,11 @@ func TestRegisterHandler_WithAddressOverride(t *testing.T) {
 func TestRegisterHandler_XForwardedFor(t *testing.T) {
 	t.Parallel()
 
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-
 	var capturedIP string
-	handler := install.RegisterHandler(func(_ install.RegisterRequest, sourceIP string) (install.RegisterResult, error) {
+	handler := install.RegisterHandler(func(_ context.Context, _ install.RegisterRequest, sourceIP string) (install.RegisterResult, error) {
 		capturedIP = sourceIP
 		return install.RegisterResult{AgentID: "id"}, nil
-	}, logger)
+	}, discardLogger())
 
 	body := `{"registration_token":"tok","port":7777,"auth_token":"auth"}`
 	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(body))
@@ -176,14 +243,32 @@ func TestRegisterHandler_XForwardedFor(t *testing.T) {
 	assert.Equal(t, "203.0.113.50", capturedIP)
 }
 
+func TestRegisterHandler_RemoteAddrNoPort(t *testing.T) {
+	t.Parallel()
+
+	var capturedIP string
+	handler := install.RegisterHandler(func(_ context.Context, _ install.RegisterRequest, sourceIP string) (install.RegisterResult, error) {
+		capturedIP = sourceIP
+		return install.RegisterResult{AgentID: "id"}, nil
+	}, discardLogger())
+
+	body := `{"registration_token":"tok","port":7777,"auth_token":"auth"}`
+	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(body))
+	req.RemoteAddr = "192.168.1.1"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusCreated, rec.Code)
+	assert.Equal(t, "192.168.1.1", capturedIP)
+}
+
 func TestRegisterHandler_MissingFields(t *testing.T) {
 	t.Parallel()
 
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	handler := install.RegisterHandler(func(_ install.RegisterRequest, _ string) (install.RegisterResult, error) {
+	handler := install.RegisterHandler(func(_ context.Context, _ install.RegisterRequest, _ string) (install.RegisterResult, error) {
 		t.Fatal("callback should not be called")
 		return install.RegisterResult{}, nil
-	}, logger)
+	}, discardLogger())
 
 	tests := []struct {
 		name string
@@ -205,13 +290,39 @@ func TestRegisterHandler_MissingFields(t *testing.T) {
 	}
 }
 
+func TestRegisterHandler_InvalidPort(t *testing.T) {
+	t.Parallel()
+
+	handler := install.RegisterHandler(func(_ context.Context, _ install.RegisterRequest, _ string) (install.RegisterResult, error) {
+		t.Fatal("callback should not be called")
+		return install.RegisterResult{}, nil
+	}, discardLogger())
+
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"port too high", `{"registration_token":"tok","port":70000,"auth_token":"auth"}`},
+		{"port negative", `{"registration_token":"tok","port":-1,"auth_token":"auth"}`},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(tc.body))
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			assert.Equal(t, http.StatusBadRequest, rec.Code)
+		})
+	}
+}
+
 func TestRegisterHandler_InvalidJSON(t *testing.T) {
 	t.Parallel()
 
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	handler := install.RegisterHandler(func(_ install.RegisterRequest, _ string) (install.RegisterResult, error) {
+	handler := install.RegisterHandler(func(_ context.Context, _ install.RegisterRequest, _ string) (install.RegisterResult, error) {
 		return install.RegisterResult{}, nil
-	}, logger)
+	}, discardLogger())
 
 	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader("not json"))
 	rec := httptest.NewRecorder()
@@ -223,10 +334,9 @@ func TestRegisterHandler_InvalidJSON(t *testing.T) {
 func TestRegisterHandler_MethodNotAllowed(t *testing.T) {
 	t.Parallel()
 
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	handler := install.RegisterHandler(func(_ install.RegisterRequest, _ string) (install.RegisterResult, error) {
+	handler := install.RegisterHandler(func(_ context.Context, _ install.RegisterRequest, _ string) (install.RegisterResult, error) {
 		return install.RegisterResult{}, nil
-	}, logger)
+	}, discardLogger())
 
 	req := httptest.NewRequest(http.MethodGet, "/register", nil)
 	rec := httptest.NewRecorder()
@@ -238,10 +348,9 @@ func TestRegisterHandler_MethodNotAllowed(t *testing.T) {
 func TestRegisterHandler_CallbackError(t *testing.T) {
 	t.Parallel()
 
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	handler := install.RegisterHandler(func(_ install.RegisterRequest, _ string) (install.RegisterResult, error) {
+	handler := install.RegisterHandler(func(_ context.Context, _ install.RegisterRequest, _ string) (install.RegisterResult, error) {
 		return install.RegisterResult{}, fmt.Errorf("token expired or already claimed")
-	}, logger)
+	}, discardLogger())
 
 	body := `{"registration_token":"tok","port":7777,"auth_token":"auth"}`
 	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(body))
@@ -249,5 +358,7 @@ func TestRegisterHandler_CallbackError(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 
 	assert.Equal(t, http.StatusUnprocessableEntity, rec.Code)
-	assert.Contains(t, rec.Body.String(), "token expired or already claimed")
+	// Error message should be generic, not leak callback internals
+	assert.Contains(t, rec.Body.String(), "registration failed")
+	assert.NotContains(t, rec.Body.String(), "token expired")
 }

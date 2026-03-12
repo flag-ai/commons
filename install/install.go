@@ -4,12 +4,14 @@ package install
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"regexp"
 	"strings"
 	"text/template"
 )
@@ -19,11 +21,17 @@ var scriptSrc string
 
 var scriptTmpl = template.Must(template.New("install").Parse(scriptSrc))
 
+// safeToken matches hex-encoded tokens (alphanumeric only).
+var safeToken = regexp.MustCompile(`^[a-zA-Z0-9]+$`)
+
+// safeRepo matches GitHub owner/repo format.
+var safeRepo = regexp.MustCompile(`^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$`)
+
 // HandlerConfig configures the install script handler.
 type HandlerConfig struct {
 	// GenerateToken extracts or validates a registration token from the request.
 	// The returned token is embedded in the install script so the agent can
-	// phone home with it.
+	// phone home with it. Must return a hex-encoded token (alphanumeric only).
 	GenerateToken func(r *http.Request) (string, error)
 
 	// ServerURL returns the base URL the install script should phone home to.
@@ -58,9 +66,26 @@ func ScriptHandler(cfg HandlerConfig) http.HandlerFunc {
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
+		if cfg.GenerateToken == nil {
+			http.Error(w, "install handler not configured", http.StatusInternalServerError)
+			return
+		}
+
 		token, err := cfg.GenerateToken(r)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// Validate token is safe for shell embedding (hex-encoded, alphanumeric only).
+		if !safeToken.MatchString(token) {
+			http.Error(w, "invalid token format", http.StatusBadRequest)
+			return
+		}
+
+		// Validate repo format to prevent shell injection.
+		if !safeRepo.MatchString(cfg.BinaryRepo) {
+			http.Error(w, "invalid binary repo format", http.StatusInternalServerError)
 			return
 		}
 
@@ -87,10 +112,11 @@ func ScriptHandler(cfg HandlerConfig) http.HandlerFunc {
 }
 
 // detectServerURL auto-detects the server base URL from request headers.
+// Only accepts "http" or "https" as the scheme from X-Forwarded-Proto.
 func detectServerURL(r *http.Request) string {
 	scheme := "http"
-	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
-		scheme = proto
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto == "https" {
+		scheme = "https"
 	} else if r.TLS != nil {
 		scheme = "https"
 	}
@@ -115,7 +141,10 @@ type RegisterResult struct {
 // RegisterCallback is invoked by RegisterHandler after decoding the request
 // and resolving the source address. The callback should validate the
 // registration token, create the agent record, and return a result.
-type RegisterCallback func(req RegisterRequest, sourceIP string) (RegisterResult, error)
+//
+// The context is derived from the HTTP request and will be cancelled when
+// the client disconnects.
+type RegisterCallback func(ctx context.Context, req RegisterRequest, sourceIP string) (RegisterResult, error)
 
 // maxRegisterBody is the maximum allowed body size for registration (64 KiB).
 const maxRegisterBody = 64 << 10
@@ -123,6 +152,10 @@ const maxRegisterBody = 64 << 10
 // RegisterHandler returns an http.HandlerFunc that processes agent
 // self-registration POST requests. It decodes the JSON body, resolves the
 // source IP, and delegates to the callback.
+//
+// Note: Source IP resolution trusts X-Forwarded-For headers. This handler
+// should be deployed behind a trusted reverse proxy that sets XFF correctly.
+// If exposed directly, clients can spoof their source IP.
 func RegisterHandler(cb RegisterCallback, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -150,15 +183,20 @@ func RegisterHandler(cb RegisterCallback, logger *slog.Logger) http.HandlerFunc 
 			return
 		}
 
+		if req.Port < 1 || req.Port > 65535 {
+			writeJSONError(w, http.StatusBadRequest, "port must be between 1 and 65535")
+			return
+		}
+
 		sourceIP := resolveSourceIP(r)
 
-		result, err := cb(req, sourceIP)
+		result, err := cb(r.Context(), req, sourceIP)
 		if err != nil {
 			logger.Error("agent registration failed",
 				slog.String("source_ip", sourceIP),
 				slog.String("error", err.Error()),
 			)
-			writeJSONError(w, http.StatusUnprocessableEntity, err.Error())
+			writeJSONError(w, http.StatusUnprocessableEntity, "registration failed")
 			return
 		}
 
@@ -174,6 +212,8 @@ func RegisterHandler(cb RegisterCallback, logger *slog.Logger) http.HandlerFunc 
 }
 
 // resolveSourceIP extracts the client IP from X-Forwarded-For or RemoteAddr.
+// Note: Trusts X-Forwarded-For unconditionally — deploy behind a trusted
+// reverse proxy that sets this header correctly.
 func resolveSourceIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		// First entry is the original client.
