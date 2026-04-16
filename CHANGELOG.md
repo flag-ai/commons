@@ -2,7 +2,7 @@
 
 All notable changes to flag-commons are recorded here.
 
-## 0.2.0
+## 0.2.0 (unreleased)
 
 - Add `bonnie` client package. Lifts the BONNIE HTTP client from KARR's
   `internal/bonnie` into a shared package so KARR, KITT, and DEVON all
