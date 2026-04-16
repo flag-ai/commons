@@ -69,6 +69,11 @@ type Client interface {
 
 	// DeleteModel removes a staged model by id.
 	DeleteModel(ctx context.Context, id string) error
+
+	// RunBenchmark streams a paired engine+benchmark run, invoking
+	// onEvent for each PairedRunEvent. Returns the terminal result event
+	// or a BonnieError if the run fails.
+	RunBenchmark(ctx context.Context, spec *PairedRunSpec, onEvent func(PairedRunEvent)) (*BenchmarkResult, error)
 }
 
 // httpClient implements Client against a BONNIE HTTP server.
