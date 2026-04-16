@@ -58,6 +58,17 @@ type Client interface {
 	// Exec runs a command on the host, delivering each stdout line via
 	// onLine, and returns the exit code when the stream closes.
 	Exec(ctx context.Context, req *ExecRequest, onLine func(string)) (*ExecResult, error)
+
+	// FetchModel stages a model on the host. The call is idempotent — a
+	// repeat request for the same (source, model_id) returns the existing
+	// entry rather than re-downloading.
+	FetchModel(ctx context.Context, req *FetchModelRequest) (*ModelEntry, error)
+
+	// ListModels returns every staged model.
+	ListModels(ctx context.Context) ([]ModelEntry, error)
+
+	// DeleteModel removes a staged model by id.
+	DeleteModel(ctx context.Context, id string) error
 }
 
 // httpClient implements Client against a BONNIE HTTP server.
