@@ -12,6 +12,7 @@ Shared Go library for the FLAG (Foundation for Local AI Governance) platform. Pr
 | `config` | Base configuration loading from secrets providers |
 | `database` | PostgreSQL connection pooling (pgx/v5) and migrations |
 | `health` | Health check registry with concurrent execution |
+| `bonnie` | HTTP client + agent registry for BONNIE services |
 
 ## Installation
 
@@ -158,6 +159,20 @@ reg.Register(health.NewHTTPChecker("api", "http://localhost:8080/health"))
 report := reg.RunAll(ctx) // Runs all checks concurrently
 // report.Healthy, report.Checks, report.Version
 ```
+
+## BONNIE Client
+
+```go
+client := bonnie.New("http://gpu-01:8000", token,
+    bonnie.WithLogger(logger),
+    bonnie.WithRetries(3),
+)
+snap, err := client.GPUStatus(ctx)
+```
+
+Use `bonnie.NewRegistry(store, 30*time.Second, logger)` to manage a set
+of agents with background health polling; `store` is any type that
+implements `bonnie.RegistryStore`.
 
 ## Full Component Bootstrap
 
