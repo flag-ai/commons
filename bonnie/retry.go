@@ -34,7 +34,7 @@ func retryableStatus(status int) bool {
 // backoffDelay returns the wait duration before retry attempt number
 // (0-indexed). If the server sent a Retry-After header we honour it;
 // otherwise we use exponential backoff with jitter.
-func backoffDelay(attempt int, retryAfter string, rng *rand.Rand) time.Duration {
+func backoffDelay(attempt int, retryAfter string) time.Duration {
 	if retryAfter != "" {
 		if secs, err := strconv.Atoi(retryAfter); err == nil && secs > 0 {
 			return time.Duration(secs) * time.Second
@@ -49,7 +49,9 @@ func backoffDelay(attempt int, retryAfter string, rng *rand.Rand) time.Duration 
 	}
 
 	// Apply ±retryJitter jitter.
-	jitter := (rng.Float64()*2 - 1) * retryJitter
+	// The global rand source is goroutine-safe (since Go 1.0) and
+	// automatically seeded (since Go 1.20). No per-client *rand.Rand needed.
+	jitter := (rand.Float64()*2 - 1) * retryJitter // #nosec G404 -- jitter for backoff, not security
 	delay := time.Duration(float64(base) * (1 + jitter))
 	if delay < 0 {
 		delay = 0

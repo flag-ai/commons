@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
 	"net/http"
 	"net/url"
 	"strings"
@@ -82,7 +81,6 @@ type httpClient struct {
 	token   string
 	opts    clientOptions
 	http    *http.Client
-	rng     *rand.Rand
 }
 
 // New constructs a Client pointing at baseURL with the given bearer token.
@@ -104,9 +102,6 @@ func New(baseURL, token string, opts ...Option) Client {
 		token:   token,
 		opts:    o,
 		http:    hc,
-		// Jitter is used only to spread retry backoff across clients;
-		// it's not security-sensitive. Crypto randomness would be overkill.
-		rng: rand.New(rand.NewSource(time.Now().UnixNano())), // #nosec G404
 	}
 }
 
@@ -167,7 +162,7 @@ func (c *httpClient) do(ctx context.Context, req requestOptions) (*http.Response
 			if !req.idempotent {
 				return nil, fmt.Errorf("bonnie: %s: %w", req.op, err)
 			}
-			if sleepErr := sleepCtx(ctx, backoffDelay(attempt, "", c.rng)); sleepErr != nil {
+			if sleepErr := sleepCtx(ctx, backoffDelay(attempt, "")); sleepErr != nil {
 				return nil, sleepErr
 			}
 			continue
@@ -182,7 +177,7 @@ func (c *httpClient) do(ctx context.Context, req requestOptions) (*http.Response
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			_ = resp.Body.Close()
 			lastErr = newBonnieError(req.op, resp.StatusCode, body)
-			if sleepErr := sleepCtx(ctx, backoffDelay(attempt, retryAfter, c.rng)); sleepErr != nil {
+			if sleepErr := sleepCtx(ctx, backoffDelay(attempt, retryAfter)); sleepErr != nil {
 				return nil, sleepErr
 			}
 			continue
