@@ -219,12 +219,12 @@ async def test_run_migrations_async_delegates(
     calls: list[tuple[object, ...]] = []
     monkeypatch.setattr(
         "flag_commons.database.migrations.run_migrations",
-        lambda loc, url, *, logger=None, revision="head": calls.append(
-            (loc, url, revision)
+        lambda loc, url, *, logger=None, revision="head", lock_timeout=0: calls.append(
+            (loc, url, revision, lock_timeout)
         ),
     )
-    await run_migrations_async(tmp_path, URL, revision="base")
-    assert calls == [(tmp_path, URL, "base")]
+    await run_migrations_async(tmp_path, URL, revision="base", lock_timeout=7)
+    assert calls == [(tmp_path, URL, "base", 7)]
 
 
 def test_create_engine_with_nullpool() -> None:
