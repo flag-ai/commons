@@ -11,7 +11,9 @@ from flag_commons.install import (
     MAX_REGISTER_BODY,
     RegisterRequest,
     RegisterResult,
+    RegistrationFailed,
     handle_register,
+    is_trusted_proxy,
     parse_trusted_proxies,
     resolve_source_ip,
 )
@@ -24,9 +26,13 @@ async def _ok(req: RegisterRequest, source_ip: str) -> RegisterResult:
 
 
 def _body(**kw: object) -> bytes:
-    payload = {"registration_token": "tok", "port": 7777, "auth_token": "auth"}
+    payload: dict[str, object] = {
+        "registration_token": "tok",
+        "port": 7777,
+        "auth_token": "auth",
+    }
     payload.update(kw)
-    return json.dumps(payload).encode()
+    return json.dumps({k: v for k, v in payload.items() if v is not ...}).encode()
 
 
 async def test_register_success() -> None:
@@ -50,7 +56,9 @@ async def test_register_with_address_override() -> None:
     [
         _body(registration_token=""),
         _body(auth_token=""),
-        json.dumps({"registration_token": "t", "auth_token": "a"}).encode(),
+        _body(port=...),
+        _body(registration_token=...),
+        _body(auth_token=...),
     ],
 )
 async def test_register_missing_fields(body: bytes) -> None:
@@ -74,9 +82,11 @@ async def test_register_invalid_json() -> None:
         assert status == 400 and payload["error"] == "invalid JSON body"
 
 
-async def test_register_unknown_field_rejected() -> None:
+async def test_register_field_errors_are_accurate() -> None:
     status, payload = await handle_register(_body(extra="x"), "1.1.1.1", _ok)
-    assert status == 400
+    assert status == 400 and payload["error"] == "unknown field(s): extra"
+    status, payload = await handle_register(_body(address=5), "1.1.1.1", _ok)
+    assert status == 400 and payload["error"] == "invalid field(s): address"
 
 
 async def test_register_oversize_body() -> None:
@@ -86,15 +96,27 @@ async def test_register_oversize_body() -> None:
     assert status == 413 and "too large" in payload["error"]
 
 
-async def test_register_callback_error(caplog: pytest.LogCaptureFixture) -> None:
+async def test_register_rejected_by_callback(caplog: pytest.LogCaptureFixture) -> None:
+    async def rejecting(req: RegisterRequest, source_ip: str) -> RegisterResult:
+        raise RegistrationFailed("token expired")
+
+    with caplog.at_level(logging.WARNING, logger="flag_commons.install.register"):
+        status, payload = await handle_register(_body(), "1.1.1.1", rejecting)
+    assert status == 422 and payload == {"error": "registration failed"}
+    assert "token expired" in caplog.text and "Traceback" not in caplog.text
+
+
+async def test_register_callback_bug_is_logged_with_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     # Go: TestRegisterHandler_CallbackError
     async def failing(req: RegisterRequest, source_ip: str) -> RegisterResult:
-        raise RuntimeError("token expired")
+        raise TypeError("consumer bug")
 
     with caplog.at_level(logging.ERROR, logger="flag_commons.install.register"):
         status, payload = await handle_register(_body(), "1.1.1.1", failing)
     assert status == 422 and payload == {"error": "registration failed"}
-    assert "token expired" in caplog.text
+    assert "consumer bug" in caplog.text and "Traceback" in caplog.text
 
 
 def test_resolve_source_ip_trusted_proxy_only() -> None:
@@ -109,12 +131,35 @@ def test_resolve_source_ip_trusted_proxy_only() -> None:
     assert resolve_source_ip("10.0.0.1", "", ["10.0.0.0/8"]) == "10.0.0.1"
     assert resolve_source_ip("10.0.0.1", " , ", ["10.0.0.0/8"]) == "10.0.0.1"
     assert resolve_source_ip("not-an-ip", xff, ["10.0.0.0/8"]) == "not-an-ip"
-    assert resolve_source_ip("10.0.0.1", xff, ["garbage"]) == "10.0.0.1"
 
 
-def test_parse_trusted_proxies() -> None:
+def test_resolve_source_ip_walks_from_the_right() -> None:
+    # FIX: the leftmost entry is client-supplied with an appending proxy.
+    proxies = ["10.0.0.0/8"]
+    assert (
+        resolve_source_ip("10.0.0.1", "1.2.3.4, 203.0.113.9", proxies) == "203.0.113.9"
+    )
+    assert (
+        resolve_source_ip("10.0.0.1", "1.2.3.4, 203.0.113.9, 10.0.0.2", proxies)
+        == "203.0.113.9"
+    )
+    assert (
+        resolve_source_ip("10.0.0.1", "10.0.0.3", proxies) == "10.0.0.1"
+    )  # only proxies listed
+    assert resolve_source_ip("10.0.0.1", "not-an-ip\nFORGED", proxies) == "10.0.0.1"
+    assert resolve_source_ip("10.0.0.1", "1.2.3.4, evil", proxies) == "10.0.0.1"
+
+
+def test_trusted_proxy_helpers(caplog: pytest.LogCaptureFixture) -> None:
     assert parse_trusted_proxies(" 10.0.0.0/8, ,192.168.1.1 ") == [
         "10.0.0.0/8",
         "192.168.1.1",
     ]
     assert parse_trusted_proxies("") == []
+    with pytest.raises(ValueError, match="10.0.0/8"):
+        parse_trusted_proxies("10.0.0/8")
+    assert is_trusted_proxy("10.1.2.3", ["10.0.0.0/8"])
+    assert not is_trusted_proxy("11.1.2.3", ["10.0.0.0/8"])
+    with caplog.at_level(logging.WARNING, logger="flag_commons.install.register"):
+        assert not is_trusted_proxy("10.1.2.3", ["garbage"])
+    assert "malformed trusted proxy" in caplog.text

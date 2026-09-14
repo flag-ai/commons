@@ -13,6 +13,9 @@ INSTALL_DIR="/usr/local/bin"
 SERVICE_USER="bonnie"
 CONFIG_DIR="/etc/bonnie"
 
+# Files created below (config, downloads) must never be readable by other users.
+umask 077
+
 # --- Prerequisites -----------------------------------------------------------
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -72,27 +75,38 @@ echo "Installing BONNIE for ${OS}/${ARCH}..."
 
 # --- Download binary ----------------------------------------------------------
 
-LATEST=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
+LATEST=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | grep -m1 '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
 if [ -z "$LATEST" ]; then
     echo "Failed to determine latest release."
     exit 1
 fi
+case "$LATEST" in
+    *[!A-Za-z0-9._-]*|.*)
+        echo "Refusing unexpected release tag: ${LATEST}"
+        exit 1
+        ;;
+esac
 echo "Latest release: ${LATEST}"
 
+# Download into a private temp dir (never a predictable path under /tmp),
+# then install root-owned and executable in one step.
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
 BINARY_URL="https://github.com/${REPO}/releases/download/${LATEST}/bonnie-${OS}-${ARCH}"
 echo "Downloading ${BINARY_URL}..."
-curl -fsSL -o /tmp/bonnie "$BINARY_URL"
-chmod +x /tmp/bonnie
-mv /tmp/bonnie "${INSTALL_DIR}/bonnie"
+curl -fsSL -o "${TMP_DIR}/bonnie" "$BINARY_URL"
+install -o root -g root -m 0755 "${TMP_DIR}/bonnie" "${INSTALL_DIR}/bonnie"
 echo "Installed bonnie to ${INSTALL_DIR}/bonnie"
 
 # --- Service user -------------------------------------------------------------
 
 if ! id -u "$SERVICE_USER" &>/dev/null; then
     useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
-    usermod -aG docker "$SERVICE_USER"
     echo "Created service user: ${SERVICE_USER}"
 fi
+# Docker socket access is root-equivalent; the systemd hardening below limits
+# the filesystem, not what the agent can do through Docker.
+usermod -aG docker "$SERVICE_USER"
 
 # --- Generate auth token ------------------------------------------------------
 
@@ -100,7 +114,7 @@ AUTH_TOKEN=$(openssl rand -hex 32)
 
 # --- Configuration ------------------------------------------------------------
 
-mkdir -p "$CONFIG_DIR"
+mkdir -p -m 700 "$CONFIG_DIR"
 cat > "${CONFIG_DIR}/bonnie.env" <<ENVEOF
 # BONNIE Configuration — managed by install script
 BONNIE_AUTH_TOKEN=${AUTH_TOKEN}
@@ -170,6 +184,12 @@ echo "BONNIE is healthy."
 # --- Phone home ---------------------------------------------------------------
 
 echo "Registering with control plane..."
+case "$ADDRESS" in
+    *[!A-Za-z0-9.:-]*)
+        echo "Error: --address may only contain letters, digits, '.', ':' and '-'."
+        exit 1
+        ;;
+esac
 REGISTER_BODY="{\"registration_token\":\"${REGISTRATION_TOKEN}\",\"port\":${PORT},\"auth_token\":\"${AUTH_TOKEN}\""
 if [ -n "$ADDRESS" ]; then
     REGISTER_BODY="${REGISTER_BODY},\"address\":\"${ADDRESS}\""
