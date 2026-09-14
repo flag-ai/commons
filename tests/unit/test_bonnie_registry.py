@@ -103,10 +103,10 @@ async def test_upsert_and_remove() -> None:
     assert reg.get("a1") is not None
     first = made["http://h1:7777"]
     await reg.upsert(_agent(1))  # same url/token: client reused
-    assert reg.get("a1") is first
+    assert id(reg.get("a1")) == id(first)
     await reg.upsert(Agent(id="a1", name="x", url="http://h1:7777", token="new"))
-    assert made["http://h1:7777"].closed  # the replaced client was closed
-    assert reg.get("a1") is not first
+    assert first.closed  # the replaced client was closed
+    assert id(reg.get("a1")) != id(first)
     await reg.remove("a1")
     await reg.remove("nope")
     assert reg.get("a1") is None
