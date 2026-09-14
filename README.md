@@ -2,8 +2,8 @@
 
 Shared Python library for the FLAG (Foundation for Local AI Governance) platform.
 It provides the foundational contracts used by FLAG components. On this branch
-the `version`, `logging`, `secrets`, `config`, `health`, `database` and `bonnie`
-packages are ported; `install` follows in the next PR of the rewrite.
+all eight packages are ported: `version`, `logging`, `secrets`, `config`,
+`health`, `database`, `bonnie` and `install`.
 
 > **Rewrite in progress.** This tree replaces the Go library, which is preserved
 > at tag `go-final-v0.2.1` (identical to `v0.2.1`). Go module consumers must keep
