@@ -1,278 +1,135 @@
-# Using flag-commons in FLAG Components
+# Using flag-commons in a FLAG component
 
-This guide covers how KARR, KITT, BONNIE, and future FLAG services import and use the commons library.
+This is the bootstrap every FLAG Python service follows. KARR is the first
+adopter; KITT and DEVON adopt it in a later phase.
 
-## Adding the Dependency
+## Install
+
+```toml
+[tool.poetry.dependencies]
+flag-commons = {git = "https://github.com/flag-ai/commons", tag = "v0.3.0", extras = ["postgres", "fastapi"]}
+```
+
+The Git dependency needs `git` in the Docker builder stage.
+
+## Bootstrap order
+
+1. **Secrets.** `provider_from_env()` returns `ChainProvider([Env, OpenBao])`
+   when `OPENBAO_ADDR` and `OPENBAO_TOKEN` are set, otherwise `EnvProvider`.
+   Environment variables always win; OpenBao fills the gaps. OpenBao keys use
+   the `path#field` form (`infra/karr#postgres_password`).
+2. **Config.** Subclass `BaseConfig` and read your own keys through the same
+   provider.
+3. **Logging.** `cfg.setup_logging()` configures the stdlib root logger.
+4. **Database.** `await connect(url)` builds the engine and pings it with
+   backoff; `run_migrations(script_dir, url)` applies the packaged Alembic
+   scripts under an advisory lock.
+5. **Health.** Register checkers, mount `health_router()`.
+6. **Version.** Bake `FLAG_BUILD_COMMIT` and `FLAG_BUILD_DATE` into the image.
+
+```python
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import FastAPI
+from pydantic import SecretStr
+
+from flag_commons.bonnie import AgentRegistry, BonnieAgentsChecker
+from flag_commons.config import BaseConfig
+from flag_commons.database import connect, run_migrations_async
+from flag_commons.health import DatabaseChecker, Registry
+from flag_commons.health.fastapi import health_router
+from flag_commons.secrets import SecretsProvider, provider_from_env
+
+
+class KarrConfig(BaseConfig):
+    admin_token: SecretStr
+
+    @classmethod
+    def load(cls, provider: SecretsProvider) -> "KarrConfig":
+        return cls(
+            **cls.base_fields("karr", provider),
+            admin_token=SecretStr(provider.get("KARR_ADMIN_TOKEN")),
+        )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    provider = provider_from_env()
+    cfg = KarrConfig.load(provider)
+    cfg.setup_logging(dist_name="karr")
+
+    url = cfg.database_url.get_secret_value()
+    engine = await connect(url)
+    await run_migrations_async(Path(__file__).parent / "db" / "migrations", url)
+
+    agents = AgentRegistry(store=MyStore(engine))
+    await agents.start()
+
+    health = Registry(dist_name="karr")
+    health.register(DatabaseChecker(engine))
+    health.register(BonnieAgentsChecker(agents), critical=False)
+    app.include_router(health_router(health))
+
+    app.state.engine, app.state.agents = engine, agents
+    try:
+        yield
+    finally:
+        await agents.stop()
+        await engine.dispose()
+
+
+app = FastAPI(lifespan=lifespan)
+```
+
+Run it with `uvicorn.run(app, host=host, port=port, log_config=uvicorn_log_config("karr"))`
+where `host, port = cfg.bind_address()`.
+
+## The health contract
+
+| Route | Meaning | Body |
+|---|---|---|
+| `GET /health` | liveness, always 200 | `{"status": "ok", "version": "<X (commit: Y, built: Z)>"}` |
+| `GET /ready` | readiness, 503 when unhealthy | `{"healthy": bool, "version": str, "checks": [{"name", "healthy", "error"?, "latency_ms", "critical"?}]}` |
+
+`critical` appears only when `false`; a non-critical failure is reported
+without flipping `healthy`. Pass `redact_errors=True` when `/ready` is
+reachable by untrusted callers.
+
+## Talking to BONNIE
+
+```python
+from flag_commons.bonnie import BonnieClient, CreateContainerRequest
+
+async with BonnieClient("http://gpu-01:7777", token) as bonnie:
+    info = await bonnie.system_info()
+    cid = await bonnie.create_container(CreateContainerRequest(name="env-1", image="vllm", gpu=True))
+    await bonnie.start_container(cid)
+    async for line in bonnie.stream_container_logs(cid):
+        print(line)
+```
+
+Idempotent calls are retried on network errors and 429/502/503/504;
+creates, start/stop/restart, exec and benchmark runs are not. Errors are
+`BonnieError` subclasses: `BonnieUnauthorized`, `BonnieNotFound`,
+`BonnieBadRequest`, `BonnieUnavailable`.
+
+## Provisioning agents
+
+`flag_commons.install.fastapi.install_router()` serves `GET /install.sh`
+(the operator pipes it into `sudo bash -s --`) and `POST /agents/register`
+(the script phones home). Supply a `token_lookup` that validates the
+registration token and a `register` callback that creates the agent row.
+
+## Testing against a real PostgreSQL
 
 ```bash
-go get github.com/flag-ai/commons@latest
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/db poetry run pytest tests/integration
 ```
 
-## Standard Initialization Pattern
+Without Postgres or Docker, `pip install pgserver` gives a local server:
 
-Every FLAG component follows the same bootstrap sequence:
-
-```go
-package main
-
-import (
-    "context"
-    "log"
-    "os"
-
-    "github.com/flag-ai/commons/config"
-    "github.com/flag-ai/commons/database"
-    "github.com/flag-ai/commons/health"
-    "github.com/flag-ai/commons/logging"
-    "github.com/flag-ai/commons/secrets"
-    "github.com/flag-ai/commons/version"
-)
-
-func main() {
-    ctx := context.Background()
-
-    // 1. Secrets provider — OpenBao in production, env vars in dev
-    provider, err := secrets.NewProvider(secrets.ProviderOpenBao, nil)
-    if err != nil {
-        provider = secrets.NewEnvProvider()
-    }
-
-    // 2. Base config — reads DATABASE_URL, LOG_LEVEL, LOG_FORMAT, LISTEN_ADDR
-    cfg, err := config.LoadBase(ctx, "karr", provider)
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    // 3. Logger — structured slog with component name and version
-    logger := cfg.Logger()
-    logger.Info("starting", "version", version.Info())
-
-    // 4. Database pool
-    pool, err := database.NewPool(ctx, cfg.DatabaseURL,
-        database.WithPoolLogger(logger),
-    )
-    if err != nil {
-        logger.Error("database connection failed", "error", err)
-        os.Exit(1)
-    }
-    defer pool.Close()
-
-    // 5. Migrations
-    if err := database.RunMigrations("file://migrations", cfg.DatabaseURL, logger); err != nil {
-        logger.Error("migration failed", "error", err)
-        os.Exit(1)
-    }
-
-    // 6. Health checks
-    reg := health.NewRegistry()
-    reg.Register(health.NewDatabaseChecker(pool))
-
-    // 7. Pass logger through context for request handlers
-    ctx = logging.WithContext(ctx, logger)
-
-    // ... start HTTP server on cfg.ListenAddr
-}
-```
-
-## Package-by-Package Guide
-
-### secrets — Retrieving Sensitive Values
-
-The `secrets.Provider` interface is the single abstraction for reading secrets. Components never read secrets directly from env vars or OpenBao — they always go through a provider.
-
-**Environment provider** (development):
-```go
-provider := secrets.NewEnvProvider()
-dbURL, err := provider.Get(ctx, "DATABASE_URL")
-port := provider.GetOrDefault(ctx, "PORT", "8080")
-```
-
-**OpenBao provider** (production):
-```go
-provider := secrets.NewOpenBaoProvider(
-    "http://openbao.service:8200",
-    token,
-    secrets.WithMount("kv"),           // secrets engine mount
-    secrets.WithLogger(logger),        // log cache misses
-    secrets.WithCacheTTL(time.Minute), // override default 5m TTL
-)
-
-// Key format: "path#field" — field defaults to "value"
-dbPass, err := provider.Get(ctx, "infra/postgres#password")
-apiKey := provider.GetOrDefault(ctx, "infra/api-keys#openai", "")
-```
-
-**Factory** (auto-detect from environment):
-```go
-// Reads OPENBAO_ADDR and OPENBAO_TOKEN from environment
-provider, err := secrets.NewProvider(secrets.ProviderOpenBao, logger)
-```
-
-### logging — Structured Logging
-
-All FLAG components use `log/slog` via the commons logging package. This ensures consistent output with component name and version attached.
-
-```go
-// Create logger
-logger := logging.New("karr",
-    logging.WithLevel(logging.ParseLevel("debug")),
-    logging.WithFormat(logging.FormatJSON),
-)
-
-// Propagate through context
-ctx = logging.WithContext(ctx, logger)
-
-// Retrieve in handlers/middleware
-func handleRequest(ctx context.Context) {
-    log := logging.FromContext(ctx)
-    log.Info("handling request", "path", "/api/v1/models")
-}
-```
-
-### config — Base Configuration
-
-`config.LoadBase` reads environment variables through a `secrets.Provider`, so it works identically whether secrets come from env vars or OpenBao.
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `DATABASE_URL` | Yes | — | PostgreSQL connection string |
-| `LOG_LEVEL` | No | `info` | Minimum log level (debug, info, warn, error) |
-| `LOG_FORMAT` | No | `text` | Log format (text, json) |
-| `LISTEN_ADDR` | No | `:8080` | HTTP listen address |
-
-Components that need additional config should embed `config.Base`:
-
-```go
-type KARRConfig struct {
-    config.Base
-    ModelRegistry string
-    MaxWorkers    int
-}
-```
-
-### database — Connection Pooling & Migrations
-
-**Pool creation** with functional options:
-```go
-pool, err := database.NewPool(ctx, cfg.DatabaseURL,
-    database.WithMaxConns(20),
-    database.WithMinConns(5),
-    database.WithMaxConnLifetime(30 * time.Minute),
-    database.WithMaxConnIdleTime(5 * time.Minute),
-    database.WithHealthCheckPeriod(30 * time.Second),
-    database.WithPoolLogger(logger),
-)
-```
-
-Note: `NewPool` returns a lazily-connected pool. Call `pool.Ping(ctx)` after creation if you need to verify connectivity immediately.
-
-**Migrations** using golang-migrate file source:
-```go
-// migrations/ directory contains 001_init.up.sql, 001_init.down.sql, etc.
-err := database.RunMigrations("file://migrations", cfg.DatabaseURL, logger)
-```
-
-### health — Health Check Registry
-
-Register checkers and run them concurrently:
-
-```go
-reg := health.NewRegistry()
-reg.Register(health.NewDatabaseChecker(pool))
-reg.Register(health.NewHTTPChecker("model-api", "http://localhost:8081/health"))
-
-// In your health endpoint handler:
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-    report := reg.RunAll(r.Context())
-    w.Header().Set("Content-Type", "application/json")
-    if !report.Healthy {
-        w.WriteHeader(http.StatusServiceUnavailable)
-    }
-    json.NewEncoder(w).Encode(report)
-}
-```
-
-Response format:
-```json
-{
-    "healthy": true,
-    "version": "1.0.0 (commit: abc123, built: 2025-06-01)",
-    "checks": [
-        {"name": "database", "healthy": true, "latency_ms": 2},
-        {"name": "model-api", "healthy": true, "latency_ms": 15}
-    ]
-}
-```
-
-**Custom checkers** implement the `health.Checker` interface:
-```go
-type RedisChecker struct {
-    client *redis.Client
-}
-
-func (c *RedisChecker) Name() string { return "redis" }
-func (c *RedisChecker) Check(ctx context.Context) error {
-    return c.client.Ping(ctx).Err()
-}
-```
-
-### version — Build-Time Info
-
-Set via ldflags in your Makefile or CI:
-
-```bash
-go build -ldflags "\
-  -X github.com/flag-ai/commons/version.Version=$(git describe --tags) \
-  -X github.com/flag-ai/commons/version.Commit=$(git rev-parse --short HEAD) \
-  -X github.com/flag-ai/commons/version.Date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-```
-
-Access in code:
-```go
-fmt.Println(version.Info())
-// "1.0.0 (commit: abc123, built: 2025-06-01T12:00:00Z)"
-```
-
-## Dependency Graph
-
-```
-version/     → (no deps, leaf)
-secrets/     → accepts *slog.Logger param
-logging/     → imports version/
-config/      → imports secrets/, logging/
-database/    → imports logging/; external: pgx/v5, golang-migrate
-health/      → imports version/; accepts *pgxpool.Pool param
-```
-
-No circular dependencies. If you add a new package, check that it doesn't introduce cycles.
-
-## Testing with Commons
-
-Use `t.Setenv` for tests that need environment variables:
-
-```go
-func TestMyHandler(t *testing.T) {
-    t.Setenv("DATABASE_URL", "postgres://localhost/testdb")
-
-    provider := secrets.NewEnvProvider()
-    cfg, err := config.LoadBase(context.Background(), "test", provider)
-    require.NoError(t, err)
-    // ...
-}
-```
-
-For OpenBao tests, use `httptest.Server` returning KV v2 JSON:
-
-```go
-srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-    resp := map[string]interface{}{
-        "data": map[string]interface{}{
-            "data": map[string]interface{}{"value": "test-secret"},
-        },
-    }
-    json.NewEncoder(w).Encode(resp)
-}))
-defer srv.Close()
-
-provider := secrets.NewOpenBaoProvider(srv.URL, "test-token")
+```python
+import pgserver, pathlib
+print(pgserver.get_server(pathlib.Path("/tmp/pg")).get_uri())
 ```
