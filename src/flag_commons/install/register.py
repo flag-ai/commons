@@ -116,7 +116,9 @@ async def handle_register(
 
 
 def _describe(exc: ValidationError) -> str:
-    fields = {str(err["loc"][0]) for err in exc.errors() if err.get("loc")}
-    if "port" in fields and fields <= {"port"}:
+    errors = exc.errors()
+    fields = {str(err["loc"][0]) for err in errors if err.get("loc")}
+    missing = any(err.get("type") == "missing" for err in errors)
+    if not missing and fields == {"port"}:
         return "port must be between 1 and 65535"
     return "registration_token, auth_token, and port are required"

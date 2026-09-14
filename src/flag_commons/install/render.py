@@ -33,7 +33,9 @@ def validate_token(token: str) -> str:
 
 
 def validate_repo(repo: str) -> str:
-    if not SAFE_REPO.match(repo or ""):
+    if not SAFE_REPO.match(repo or "") or any(
+        part in (".", "..") for part in repo.split("/")
+    ):
         raise InstallScriptError("invalid binary repo format")
     return repo
 
