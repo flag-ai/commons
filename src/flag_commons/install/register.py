@@ -88,11 +88,11 @@ def resolve_source_ip(
         if not hop:
             continue
         try:
-            ipaddress.ip_address(hop)
+            normalized = str(ipaddress.ip_address(hop))
         except ValueError:
             return peer_ip
-        if not is_trusted_proxy(hop, proxies):
-            return hop
+        if not is_trusted_proxy(normalized, proxies):
+            return normalized
     return peer_ip
 
 
@@ -115,7 +115,7 @@ async def handle_register(
         return 413, {"error": "request body too large"}
     try:
         payload = json.loads(body)
-    except ValueError:
+    except (ValueError, RecursionError):  # deeply nested input raises RecursionError
         return 400, {"error": "invalid JSON body"}
     if not isinstance(payload, dict):
         return 400, {"error": "invalid JSON body"}

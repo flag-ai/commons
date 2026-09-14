@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import re
 import shlex
 from importlib import resources
@@ -15,11 +16,26 @@ SAFE_TOKEN = re.compile(r"[a-zA-Z0-9]+")
 SAFE_REPO = re.compile(r"[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+")
 SAFE_HOST = re.compile(r"[A-Za-z0-9.\-]+|\[[0-9A-Fa-f:.]+\]")
 SAFE_PATH = re.compile(r"(/[A-Za-z0-9._\-]+)*")
-SAFE_ADDRESS = re.compile(r"[A-Za-z0-9.:\-]+")
+SAFE_ADDRESS = re.compile(r"[A-Za-z0-9.:][A-Za-z0-9.:\-]*")
 
 
 class InstallScriptError(ValueError):
     """A value could not be embedded safely in the install script."""
+
+
+class InvalidTokenError(InstallScriptError):
+    """The registration token is not a safe alphanumeric string."""
+
+
+def _is_local_host(host: str) -> bool:
+    """Loopback or private-range IP literal, or a plain localhost name."""
+    if host in ("localhost", "localhost."):
+        return True
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_private
 
 
 def _script_source() -> str:
@@ -30,7 +46,7 @@ def _script_source() -> str:
 
 def validate_token(token: str) -> str:
     if not isinstance(token, str) or not SAFE_TOKEN.fullmatch(token):
-        raise InstallScriptError("invalid token format")
+        raise InvalidTokenError("invalid token format")
     return token
 
 
@@ -42,13 +58,17 @@ def validate_repo(repo: str) -> str:
     return repo
 
 
-def validate_server_url(url: str) -> str:
-    """Accept only ``http(s)://host[:port][/path]`` and return it normalised.
+def validate_server_url(url: str, *, allow_insecure: bool = False) -> str:
+    """Accept only ``https://host[:port][/path]`` and return it normalised.
 
     The host may be a name, an IPv4 address or a bracketed IPv6 literal; no
     userinfo, query or fragment; the path is limited to plain segments. The
     value is rebuilt from its parts, so nothing outside those rules can reach
     the script. Go interpolated the ``Host`` header unquoted.
+
+    The rendered script POSTs the new agent's auth token to this URL, so
+    ``http`` is accepted only for loopback/private-IP hosts or with
+    ``allow_insecure=True``.
     """
     raw = (url or "").strip()
     if re.search(r"\s", raw):
@@ -67,12 +87,18 @@ def validate_server_url(url: str) -> str:
         host = f"[{host}]"
     if not SAFE_HOST.fullmatch(host):
         raise InstallScriptError("server_url contains unsafe characters")
+    if parts.scheme == "http" and not allow_insecure and not _is_local_host(host):
+        raise InstallScriptError(
+            "server_url must use https (the agent posts its auth token to it)"
+        )
     try:
         port = parts.port
     except ValueError as exc:
         raise InstallScriptError("server_url has an invalid port") from exc
+    if port == 0:
+        raise InstallScriptError("server_url has an invalid port")
     path = parts.path.rstrip("/")
-    if not SAFE_PATH.fullmatch(path):
+    if not SAFE_PATH.fullmatch(path) or ".." in path.split("/"):
         raise InstallScriptError("server_url contains unsafe characters")
     netloc = f"{host}:{port}" if port is not None else host
     return f"{parts.scheme}://{netloc}{path}"
@@ -90,11 +116,14 @@ def render_install_script(
     *,
     repo: str = DEFAULT_REPO,
     port: int = DEFAULT_PORT,
+    allow_insecure: bool = False,
 ) -> str:
     """Return ``script.sh`` with the values substituted, each shell-quoted."""
     values = {
         "{{.BinaryRepo}}": shlex.quote(validate_repo(repo)),
-        "{{.ServerURL}}": shlex.quote(validate_server_url(server_url)),
+        "{{.ServerURL}}": shlex.quote(
+            validate_server_url(server_url, allow_insecure=allow_insecure)
+        ),
         "{{.RegistrationToken}}": shlex.quote(validate_token(token)),
         "{{.Port}}": str(validate_port(port)),
     }
@@ -112,6 +141,7 @@ def install_command(
     *,
     address: str | None = None,
     script_path: str = DEFAULT_SCRIPT_PATH,
+    allow_insecure: bool = False,
 ) -> str:
     """The one-liner an operator pastes on the GPU host.
 
@@ -119,9 +149,8 @@ def install_command(
     """
     if not SAFE_PATH.fullmatch(script_path) or not script_path.startswith("/"):
         raise InstallScriptError("script_path contains unsafe characters")
-    url = (
-        f"{validate_server_url(server_url)}{script_path}?token={validate_token(token)}"
-    )
+    base = validate_server_url(server_url, allow_insecure=allow_insecure)
+    url = f"{base}{script_path}?token={validate_token(token)}"
     cmd = f"curl -fsSL {shlex.quote(url)} | sudo bash -s --"
     if address:
         if not SAFE_ADDRESS.fullmatch(address):

@@ -77,7 +77,7 @@ async def test_register_invalid_port(port: int) -> None:
 
 async def test_register_invalid_json() -> None:
     # Go: TestRegisterHandler_InvalidJSON
-    for body in (b"{not json", b"[]", b'"str"'):
+    for body in (b"{not json", b"[]", b'"str"', b"[" * 30_000 + b"]" * 30_000):
         status, payload = await handle_register(body, "1.1.1.1", _ok)
         assert status == 400 and payload["error"] == "invalid JSON body"
 
@@ -148,6 +148,11 @@ def test_resolve_source_ip_walks_from_the_right() -> None:
     )  # only proxies listed
     assert resolve_source_ip("10.0.0.1", "not-an-ip\nFORGED", proxies) == "10.0.0.1"
     assert resolve_source_ip("10.0.0.1", "1.2.3.4, evil", proxies) == "10.0.0.1"
+    assert (
+        resolve_source_ip("10.0.0.1", "::ffff:203.0.113.9", proxies)
+        == "::ffff:203.0.113.9"
+    )
+    assert resolve_source_ip("10.0.0.1", "203.000.113.009", proxies) == "10.0.0.1"
 
 
 def test_trusted_proxy_helpers(caplog: pytest.LogCaptureFixture) -> None:

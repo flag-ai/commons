@@ -39,6 +39,11 @@ if ! command -v docker &>/dev/null; then
     exit 1
 fi
 
+if ! command -v openssl &>/dev/null; then
+    echo "Error: openssl is required but not installed."
+    exit 1
+fi
+
 # --- Parse arguments ----------------------------------------------------------
 
 ADDRESS=""
@@ -115,6 +120,7 @@ AUTH_TOKEN=$(openssl rand -hex 32)
 # --- Configuration ------------------------------------------------------------
 
 mkdir -p -m 700 "$CONFIG_DIR"
+chmod 700 "$CONFIG_DIR"
 cat > "${CONFIG_DIR}/bonnie.env" <<ENVEOF
 # BONNIE Configuration — managed by install script
 BONNIE_AUTH_TOKEN=${AUTH_TOKEN}
@@ -123,8 +129,9 @@ BONNIE_POLL_INTERVAL=10
 LOG_LEVEL=info
 LOG_FORMAT=json
 ENVEOF
-chmod 600 "${CONFIG_DIR}/bonnie.env"
-chown "$SERVICE_USER":"$SERVICE_USER" "${CONFIG_DIR}/bonnie.env"
+# Readable by the service, writable only by root.
+chown root:"$SERVICE_USER" "${CONFIG_DIR}/bonnie.env"
+chmod 640 "${CONFIG_DIR}/bonnie.env"
 echo "Created config at ${CONFIG_DIR}/bonnie.env"
 
 # --- Systemd service ----------------------------------------------------------
@@ -196,7 +203,8 @@ if [ -n "$ADDRESS" ]; then
 fi
 REGISTER_BODY="${REGISTER_BODY}}"
 
-RESPONSE=$(curl -fsSL -X POST \
+# No -L: a redirect must never re-send the auth token elsewhere.
+RESPONSE=$(curl -fsS -X POST \
     -H "Content-Type: application/json" \
     -d "$REGISTER_BODY" \
     "${SERVER_URL}/api/v1/agents/register" 2>&1) || {

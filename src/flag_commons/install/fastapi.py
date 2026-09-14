@@ -29,7 +29,9 @@ from flag_commons.install.register import (
 from flag_commons.install.render import (
     DEFAULT_PORT,
     DEFAULT_REPO,
+    SAFE_HOST,
     InstallScriptError,
+    InvalidTokenError,
     render_install_script,
     validate_port,
     validate_repo,
@@ -62,8 +64,18 @@ def peer_ip(request: Request) -> str:
     return request.client.host if request.client and request.client.host else "unknown"
 
 
-def detect_server_url(request: Request, trusted_proxies: Iterable[str]) -> str | None:
-    """Scheme and host as forwarded by a trusted proxy, else ``None``."""
+def detect_server_url(
+    request: Request,
+    trusted_proxies: Iterable[str],
+    allowed_hosts: Iterable[str] = (),
+) -> str | None:
+    """Scheme and host as forwarded by a trusted proxy, else ``None``.
+
+    The forwarded host must be a bare ``host[:port]`` (no path), and when
+    ``allowed_hosts`` is given it must be one of them. Many proxies copy the
+    client's own ``Host`` header into ``X-Forwarded-Host``, so the trusted
+    peer alone does not vouch for the value.
+    """
     if not is_trusted_proxy(peer_ip(request), trusted_proxies):
         return None
     proto = (
@@ -71,6 +83,14 @@ def detect_server_url(request: Request, trusted_proxies: Iterable[str]) -> str |
     )
     host = request.headers.get("x-forwarded-host", "").split(",", 1)[0].strip()
     if proto not in ("http", "https") or not host:
+        return None
+    bare, port = host, ""
+    if host.count(":") == 1:
+        bare, _, port = host.rpartition(":")
+    if not SAFE_HOST.fullmatch(bare) or (port and not port.isdigit()):
+        return None
+    allowed = list(allowed_hosts)
+    if allowed and host not in allowed and bare not in allowed:
         return None
     return f"{proto}://{host}"
 
@@ -81,8 +101,10 @@ def install_router(
     register: RegisterCallback,
     server_url: ServerURL = None,
     trusted_proxies: Iterable[str] = (),
+    allowed_hosts: Iterable[str] = (),
     repo: str = DEFAULT_REPO,
     port: int = DEFAULT_PORT,
+    allow_insecure: bool = False,
     logger: logging.Logger | None = None,
 ) -> APIRouter:
     """Build the router.
@@ -98,8 +120,9 @@ def install_router(
     validate_repo(repo)
     validate_port(port)
     if isinstance(server_url, str):
-        server_url = validate_server_url(server_url)
+        server_url = validate_server_url(server_url, allow_insecure=allow_insecure)
     proxies = list(trusted_proxies)
+    hosts = list(allowed_hosts)
     log = logger or _log
     router = APIRouter(tags=["install"])
 
@@ -125,7 +148,7 @@ def install_router(
         elif server_url:
             base = server_url
         else:
-            base = detect_server_url(request, proxies)
+            base = detect_server_url(request, proxies, hosts)
         if not base:
             log.error(
                 "install script requested without a server_url and not via a trusted proxy"
@@ -135,13 +158,22 @@ def install_router(
             )
 
         try:
-            script = render_install_script(token, base, repo=repo, port=port)
+            script = render_install_script(
+                token, base, repo=repo, port=port, allow_insecure=allow_insecure
+            )
+        except InvalidTokenError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
         except InstallScriptError as exc:
-            # Only the token and the detected URL vary per request.
-            status = 400 if "token" in str(exc) else 500
             log.error("install script render failed: %s", exc)
-            return JSONResponse({"error": str(exc)}, status_code=status)
-        return Response(script, media_type="text/x-shellscript")
+            return JSONResponse(
+                {"error": "install script unavailable"}, status_code=500
+            )
+        # The script embeds a one-time token: never let a shared cache keep it.
+        return Response(
+            script,
+            media_type="text/x-shellscript",
+            headers={"Cache-Control": "no-store", "Vary": "*"},
+        )
 
     @router.post("/agents/register", summary="Agent self-registration")
     async def agents_register(request: Request) -> JSONResponse:

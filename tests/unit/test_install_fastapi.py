@@ -62,6 +62,7 @@ def test_install_script_ok() -> None:
     assert resp.headers["content-type"].startswith("text/x-shellscript")
     assert f"REGISTRATION_TOKEN={TOKEN}\n" in resp.text
     assert f"SERVER_URL={FIXED_URL}\n" in resp.text
+    assert resp.headers["cache-control"] == "no-store"
 
 
 @pytest.mark.parametrize(
@@ -128,6 +129,32 @@ def test_server_url_from_trusted_proxy_headers() -> None:
         headers={"X-Forwarded-Proto": "https", "X-Forwarded-Host": "evil$(id).example"},
     )
     assert injected.status_code == 500
+    with_path = _client(server_url=None, trusted_proxies=PROXIES).get(
+        f"/api/v1/install.sh?token={TOKEN}",
+        headers={"X-Forwarded-Proto": "https", "X-Forwarded-Host": "evil.example/x"},
+    )
+    assert with_path.status_code == 500
+    plain_http = _client(server_url=None, trusted_proxies=PROXIES).get(
+        f"/api/v1/install.sh?token={TOKEN}",
+        headers={
+            "X-Forwarded-Proto": "http",
+            "X-Forwarded-Host": "karr.public.example",
+        },
+    )
+    assert plain_http.status_code == 500  # the auth token would travel in cleartext
+
+
+def test_allowed_hosts_restrict_forwarded_host() -> None:
+    headers = {"X-Forwarded-Proto": "https", "X-Forwarded-Host": "karr.public.example"}
+    ok = _client(
+        server_url=None, trusted_proxies=PROXIES, allowed_hosts=["karr.public.example"]
+    ).get(f"/api/v1/install.sh?token={TOKEN}", headers=headers)
+    assert ok.status_code == 200
+    other = _client(
+        server_url=None, trusted_proxies=PROXIES, allowed_hosts=["karr.other.example"]
+    ).get(f"/api/v1/install.sh?token={TOKEN}", headers=headers)
+    assert other.status_code == 500
+    assert "karr.public.example" not in other.text
 
 
 def test_server_url_callable_and_startup_validation() -> None:
@@ -137,7 +164,17 @@ def test_server_url_callable_and_startup_validation() -> None:
         in dyn.get(f"/api/v1/install.sh?token={TOKEN}").text
     )
     bad_dyn = _client(server_url=lambda r: "https://evil.example/$(id)")
-    assert bad_dyn.get(f"/api/v1/install.sh?token={TOKEN}").status_code == 500
+    resp = bad_dyn.get(f"/api/v1/install.sh?token={TOKEN}")
+    assert resp.status_code == 500 and resp.json() == {
+        "error": "install script unavailable"
+    }
+    insecure = _client(server_url="http://karr.example.com", allow_insecure=True)
+    assert (
+        "SERVER_URL=http://karr.example.com\n"
+        in insecure.get(f"/api/v1/install.sh?token={TOKEN}").text
+    )
+    with pytest.raises(InstallScriptError, match="https"):
+        _client(server_url="http://karr.example.com")
     with pytest.raises(InstallScriptError):
         _client(server_url="https://evil.example/$(id)")
     with pytest.raises(InstallScriptError):
