@@ -23,3 +23,8 @@ def _reset_root_logging() -> Iterator[None]:
         if handler not in root.handlers:
             root.addHandler(handler)
     root.setLevel(saved_level)
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
