@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main, rewrite/python]
+  pull_request:
+    branches: [main, rewrite/python]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: snok/install-poetry@a783c322200f0519c7926aa6faa857c4e23e9263 # v1.4.2
+      - name: Install dependencies
+        run: poetry install --with dev --extras all
+      - name: Check import
+        run: poetry run python -c "import flag_commons; print(f'flag-commons {flag_commons.__version__}')"
+      - name: Ruff lint
+        run: poetry run ruff check src tests
+      - name: Ruff format check
+        run: poetry run ruff format --check src tests
+      - name: Mypy (strict)
+        run: poetry run mypy
+
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: snok/install-poetry@a783c322200f0519c7926aa6faa857c4e23e9263 # v1.4.2
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+      - uses: actions/cache@v4
+        with:
+          path: .venv
+          key: ${{ runner.os }}-py${{ matrix.python-version }}-poetry-${{ hashFiles('poetry.lock') }}
+      - name: Install dependencies
+        run: poetry install --with dev --extras all
+      - name: Run unit tests
+        run: poetry run pytest tests/unit -v --cov=flag_commons --cov-report=term --cov-report=xml
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: snok/install-poetry@a783c322200f0519c7926aa6faa857c4e23e9263 # v1.4.2
+      - name: Install dependencies
+        run: poetry install --with dev --extras all
+      - name: Bandit
+        run: poetry run bandit -c pyproject.toml -r src
+      - name: pip-audit
+        run: poetry run pip-audit --skip-editable
