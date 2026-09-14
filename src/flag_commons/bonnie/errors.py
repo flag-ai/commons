@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 import json
+import re
 
 MAX_ERROR_BODY = 4096
+_CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+
+
+def sanitize(text: str) -> str:
+    """Strip control characters so server-controlled text cannot forge log lines."""
+    return _CONTROL.sub(" ", text)
 
 
 class BonnieError(Exception):
@@ -20,7 +27,9 @@ class BonnieError(Exception):
         self.op = op
         self.status = status
         self.body = body[:MAX_ERROR_BODY]
-        self.message = message if message is not None else _extract_message(self.body)
+        self.message = sanitize(
+            message if message is not None else _extract_message(self.body)
+        )
         super().__init__(self._render())
 
     def _render(self) -> str:

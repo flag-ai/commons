@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
-from collections.abc import Callable
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Protocol
 
@@ -31,7 +30,7 @@ class Agent:
     id: str
     name: str
     url: str
-    token: str = ""
+    token: str = field(default="", repr=False)
     status: str = STATUS_OFFLINE
     last_seen_at: datetime | None = None
     last_checked_at: datetime | None = None
@@ -110,13 +109,15 @@ class AgentRegistry:
         self._entries: dict[str, _Entry] = {}
         self._lock = asyncio.Lock()
         self._task: asyncio.Task[None] | None = None
+        self._started = False
 
     # --- lifecycle --------------------------------------------------------
 
     async def start(self) -> None:
         """Reload, poll once, then keep polling and reloading in the background."""
-        if self._task is not None and not self._task.done():
+        if self._started:
             return
+        self._started = True
         try:
             await self.reload()
         except Exception as exc:  # noqa: BLE001
@@ -129,22 +130,25 @@ class AgentRegistry:
         """Cancel the background loop and close every client."""
         if self._task is not None:
             self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._task
+            # wait() never re-raises the task's own CancelledError, and it
+            # still propagates a cancellation aimed at the caller.
+            await asyncio.wait([self._task])
             self._task = None
         async with self._lock:
             entries = list(self._entries.values())
             self._entries = {}
-        for entry in entries:
-            await entry.client.aclose()
+        await _close_all(e.client for e in entries)
 
     async def _loop(self) -> None:
-        since_reload = 0.0
+        loop = asyncio.get_running_loop()
+        last_reload = loop.time()
         while True:
             await asyncio.sleep(self.poll_interval)
-            since_reload += self.poll_interval
-            if self.reload_interval > 0 and since_reload >= self.reload_interval:
-                since_reload = 0.0
+            if (
+                self.reload_interval > 0
+                and loop.time() - last_reload >= self.reload_interval
+            ):
+                last_reload = loop.time()
                 try:
                     await self.reload()
                 except Exception as exc:  # noqa: BLE001
@@ -182,8 +186,7 @@ class AgentRegistry:
                 if agent_id not in next_entries:
                     stale.append(entry.client)
             self._entries = next_entries
-        for client in stale:
-            await client.aclose()
+        await _close_all(stale)
         self._log.debug("bonnie: registry reloaded: count=%d", len(next_entries))
 
     async def upsert(self, agent: Agent) -> None:
@@ -214,17 +217,21 @@ class AgentRegistry:
         entry = self._entries.get(agent_id)
         return entry.client if entry else None
 
+    # Read-only accessors snapshot the dict first so they are safe from a
+    # worker thread while the loop mutates it.
+
     def all(self) -> dict[str, BonnieClient]:
-        return {agent_id: e.client for agent_id, e in self._entries.items()}
+        return {agent_id: e.client for agent_id, e in list(self._entries.items())}
 
     def agents(self) -> list[Agent]:
-        return [e.agent for e in self._entries.values()]
+        return [e.agent for e in list(self._entries.values())]
 
     def has_online_agent(self) -> None:
         """Return normally when at least one agent is online, else raise."""
-        if not self._entries:
+        entries = list(self._entries.values())
+        if not entries:
             raise NoAgentsRegistered()
-        if not any(e.agent.status == STATUS_ONLINE for e in self._entries.values()):
+        if not any(e.agent.status == STATUS_ONLINE for e in entries):
             raise NoOnlineAgents()
 
     # --- polling ----------------------------------------------------------
@@ -246,8 +253,12 @@ class AgentRegistry:
         now = datetime.now(timezone.utc)
         agent = entry.agent
         try:
-            await entry.client.health()
+            report = await entry.client.health()
             status = STATUS_ONLINE
+            if not report.healthy:
+                # Reachable but reporting itself unhealthy: not a usable host.
+                status = STATUS_OFFLINE
+                self._log.debug("bonnie: agent reports unhealthy: agent=%s", agent.name)
         except BonnieUnauthorized as exc:
             status = STATUS_UNAUTHORIZED
             self._log.warning(
@@ -292,5 +303,13 @@ class BonnieAgentsChecker:
     def __init__(self, registry: AgentRegistry) -> None:
         self._registry = registry
 
-    def check(self) -> None:
+    async def check(self) -> None:
         self._registry.has_online_agent()
+
+
+async def _close_all(clients: Iterable[BonnieClient]) -> None:
+    for client in clients:
+        try:
+            await client.aclose()
+        except Exception as exc:  # noqa: BLE001 - keep closing the rest
+            _log.debug("bonnie: closing client failed: %s", exc)

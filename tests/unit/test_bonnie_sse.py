@@ -6,8 +6,13 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-from flag_commons.bonnie import SSEFrame, demux_stdcopy, parse_sse
-from flag_commons.bonnie.sse import iter_lines, looks_like_stdcopy
+from flag_commons.bonnie import SSEFrame, SSEOverflow, demux_stdcopy, parse_sse
+from flag_commons.bonnie.sse import (
+    MAX_FRAME_BYTES,
+    MAX_LINE_BYTES,
+    iter_lines,
+    looks_like_stdcopy,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -117,6 +122,18 @@ async def test_demux_header_split_by_newline_byte() -> None:
 async def test_demux_is_noop_on_clean_input() -> None:
     frames = await _frames(b"data: clean\n\n", demux=True)
     assert frames[0].lines == ["clean"]
+
+
+async def test_overlong_line_is_rejected() -> None:
+    with pytest.raises(SSEOverflow, match="line"):
+        await _frames(b"data: " + b"x" * (MAX_LINE_BYTES + 1))
+
+
+async def test_oversized_frame_is_rejected() -> None:
+    line = b"data: " + b"y" * 65_000 + b"\n"
+    count = MAX_FRAME_BYTES // 65_000 + 2
+    with pytest.raises(SSEOverflow, match="frame"):
+        await _frames(line * count)
 
 
 async def test_iter_lines() -> None:

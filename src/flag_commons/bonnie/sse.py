@@ -19,8 +19,19 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
+from flag_commons.bonnie.errors import BonnieError
+
 STDCOPY_HEADER_LEN = 8
 _STDCOPY_STREAMS = (0, 1, 2)
+MAX_LINE_BYTES = 1024 * 1024  # Go's scanner buffer was 1 MiB
+MAX_FRAME_BYTES = 8 * 1024 * 1024
+
+
+class SSEOverflow(BonnieError):
+    """A line or frame exceeded the parser's size limits."""
+
+    def __init__(self, what: str, limit: int) -> None:
+        super().__init__("sse", None, "", f"{what} exceeds {limit} bytes")
 
 
 @dataclass
@@ -72,6 +83,8 @@ async def iter_lines(chunks: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
         while True:
             idx = buffer.find(b"\n")
             if idx < 0:
+                if len(buffer) > MAX_LINE_BYTES:
+                    raise SSEOverflow("line", MAX_LINE_BYTES)
                 break
             line = buffer[:idx]
             buffer = buffer[idx + 1 :]
@@ -86,16 +99,18 @@ async def parse_sse(
     """Yield frames from a byte stream. ``demux`` strips stdcopy headers."""
     frame = SSEFrame()
     open_frame = False
+    frame_bytes = 0
     pending_header = b""  # partial stdcopy header split by a newline byte
 
     def flush() -> SSEFrame | None:
-        nonlocal frame, open_frame
+        nonlocal frame, open_frame, frame_bytes
         if not open_frame:
             return None
         done = frame
         done.data = "\n".join(done.lines)
         frame = SSEFrame()
         open_frame = False
+        frame_bytes = 0
         return done
 
     async for raw in iter_lines(chunks):
@@ -124,6 +139,9 @@ async def parse_sse(
                 continue
             payload = demuxed
         open_frame = True
+        frame_bytes += len(payload) + 1
+        if frame_bytes > MAX_FRAME_BYTES:
+            raise SSEOverflow("frame", MAX_FRAME_BYTES)
         frame.lines.append(payload.decode("utf-8", "replace"))
     done = flush()
     if done is not None:

@@ -19,9 +19,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 RUN_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
 
-GPUVendor = Literal["nvidia", "amd", "intel", "none"]
 BenchmarkKind = Literal["yaml", "container"]
-EventType = Literal["status", "progress", "result", "error"]
+# BONNIE emits status/progress/result/error today; the event model keeps
+# ``type`` open so a newer BONNIE can add event types without being dropped.
+KNOWN_EVENT_TYPES = frozenset({"status", "progress", "result", "error"})
 
 
 class _Wire(BaseModel):
@@ -32,19 +33,14 @@ class _Request(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     def to_wire(self) -> dict[str, Any]:
-        """JSON-ready dict with Go ``omitempty`` semantics for optional fields."""
-        data = self.model_dump(mode="json")
-        return {
-            k: v
-            for k, v in data.items()
-            if not (
-                v is None or v == [] or v == {} or (v == "" and k in self.omit_empty())
-            )
-        }
+        """JSON-ready dict with Go ``omitempty`` semantics.
 
-    @classmethod
-    def omit_empty(cls) -> frozenset[str]:
-        return frozenset()
+        Optional strings default to ``None`` and are dropped; empty lists and
+        dicts are dropped; ``""`` and ``False`` are sent, as Go did for
+        fields without ``omitempty`` (``image``, ``model_path``, ``gpu``).
+        """
+        data = self.model_dump(mode="json")
+        return {k: v for k, v in data.items() if not (v is None or v == [] or v == {})}
 
 
 # --- health -------------------------------------------------------------------
@@ -181,10 +177,6 @@ class EngineSpec(_Request):
     model_path: str = ""
     health_check: HealthCheck
 
-    @classmethod
-    def omit_empty(cls) -> frozenset[str]:
-        return frozenset()
-
 
 class BenchmarkSpec(_Request):
     kind: BenchmarkKind
@@ -216,7 +208,7 @@ class PairedRunSpec(_Request):
 
 
 class BenchmarkEvent(_Wire):
-    type: EventType
+    type: str
     phase: str = ""
     source: str = ""
     line: str = ""

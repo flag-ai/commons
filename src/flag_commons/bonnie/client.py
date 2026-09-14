@@ -8,10 +8,11 @@ import logging
 import random
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from typing import Any
-from urllib.parse import quote
+from typing import Any, TypeVar
+from urllib.parse import quote, urlsplit
 
 import httpx
+from pydantic import BaseModel, ValidationError
 
 from flag_commons.bonnie.errors import (
     MAX_ERROR_BODY,
@@ -42,7 +43,10 @@ DEFAULT_FETCH_TIMEOUT = 3600.0
 RETRY_BASE_DELAY = 0.1
 RETRY_MAX_DELAY = 5.0
 RETRY_JITTER = 0.25
+RETRY_AFTER_MAX = 30.0  # a server-supplied Retry-After is clamped to this
 RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
+
+_M = TypeVar("_M", bound=BaseModel)
 
 _log = logging.getLogger(__name__)
 
@@ -55,7 +59,7 @@ def backoff_delay(attempt: int, retry_after: str | None = None) -> float:
         except ValueError:
             secs = 0
         if secs > 0:
-            return float(secs)
+            return float(min(secs, RETRY_AFTER_MAX))
     base = min(RETRY_MAX_DELAY, RETRY_BASE_DELAY * (2**attempt))
     jitter = (random.random() * 2 - 1) * RETRY_JITTER  # nosec B311
     return float(max(0.0, base * (1 + jitter)))
@@ -92,6 +96,11 @@ class BonnieClient:
         self.fetch_timeout = fetch_timeout
         self._token = token
         self._log = logger or _log
+        if token and _plaintext_remote(self.base_url):
+            self._log.warning(
+                "bonnie: sending a bearer token over plaintext http: url=%s",
+                self.base_url,
+            )
         headers = {"Accept": "application/json"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
@@ -130,8 +139,8 @@ class BonnieClient:
         retry_on_timeout: bool = True,
     ) -> httpx.Response:
         attempts = self.retries if idempotent else 1
-        last_error: BonnieError | None = None
         for attempt in range(attempts):
+            last = attempt + 1 >= attempts
             if attempt:
                 self._log.info(
                     "bonnie: retrying request: op=%s attempt=%d of=%d",
@@ -147,15 +156,17 @@ class BonnieClient:
                     timeout=timeout if timeout is not None else self.timeout,
                 )
             except httpx.TimeoutException as exc:
-                last_error = BonnieUnavailable(op, f"timeout: {exc}")
-                if not retry_on_timeout or attempt + 1 >= attempts:
-                    raise last_error from exc
+                error: BonnieError = BonnieUnavailable(op, f"timeout: {exc}")
+                if not retry_on_timeout or last:
+                    self._fail(op, 1 if not retry_on_timeout else attempts, error)
+                    raise error from exc
                 await self._sleep(backoff_delay(attempt))
                 continue
             except httpx.HTTPError as exc:
-                last_error = BonnieUnavailable(op, str(exc) or exc.__class__.__name__)
-                if attempt + 1 >= attempts:
-                    raise last_error from exc
+                error = BonnieUnavailable(op, str(exc) or exc.__class__.__name__)
+                if last:
+                    self._fail(op, attempts, error)
+                    raise error from exc
                 await self._sleep(backoff_delay(attempt))
                 continue
 
@@ -166,28 +177,29 @@ class BonnieClient:
                 path,
                 resp.status_code,
             )
-            if (
-                idempotent
-                and resp.status_code in RETRYABLE_STATUSES
-                and attempt + 1 < attempts
-            ):
-                last_error = error_for(op, resp.status_code, resp.text[:MAX_ERROR_BODY])
-                await self._sleep(
-                    backoff_delay(attempt, resp.headers.get("Retry-After"))
-                )
-                continue
-            if resp.status_code >= 300:
-                raise error_for(op, resp.status_code, resp.text[:MAX_ERROR_BODY])
-            return resp
-        if last_error is None:  # pragma: no cover - the loop always sets it
-            raise BonnieUnavailable(op, "no attempts made")
-        self._log.warning(
-            "bonnie: request failed after retries: op=%s attempts=%d error=%s",
-            op,
-            attempts,
-            last_error,
-        )
-        raise last_error
+            if resp.status_code < 300:
+                return resp
+            error = error_for(op, resp.status_code, resp.text[:MAX_ERROR_BODY])
+            if idempotent and resp.status_code in RETRYABLE_STATUSES:
+                if not last:
+                    await self._sleep(
+                        backoff_delay(attempt, resp.headers.get("Retry-After"))
+                    )
+                    continue
+                self._fail(op, attempts, error)
+            raise error
+        raise BonnieUnavailable(
+            op, "no attempts made"
+        )  # pragma: no cover - retries >= 1
+
+    def _fail(self, op: str, attempts: int, error: BonnieError) -> None:
+        if attempts > 1:
+            self._log.warning(
+                "bonnie: request failed after retries: op=%s attempts=%d error=%s",
+                op,
+                attempts,
+                error,
+            )
 
     @asynccontextmanager
     async def _stream(
@@ -210,9 +222,12 @@ class BonnieClient:
                 timeout=timeout,
             ) as resp:
                 if resp.status_code >= 300:
-                    body = (await resp.aread())[:MAX_ERROR_BODY].decode(
-                        "utf-8", "replace"
-                    )
+                    chunks = b""
+                    async for chunk in resp.aiter_bytes():
+                        chunks += chunk
+                        if len(chunks) >= MAX_ERROR_BODY:
+                            break
+                    body = chunks[:MAX_ERROR_BODY].decode("utf-8", "replace")
                     raise error_for(op, resp.status_code, body)
                 self._log.debug("bonnie: stream open: op=%s", op)
                 yield resp
@@ -230,26 +245,55 @@ class BonnieClient:
                 op, resp.status_code, resp.text[:MAX_ERROR_BODY], f"decode {op}: {exc}"
             ) from exc
 
+    @staticmethod
+    def _decode(model: type[_M], data: Any, resp: httpx.Response, op: str) -> _M:
+        """Validate ``data`` into ``model``; a wrong shape is a typed decode error."""
+        try:
+            return model.model_validate(data)
+        except ValidationError as exc:
+            raise BonnieError(
+                op,
+                resp.status_code,
+                resp.text[:MAX_ERROR_BODY],
+                f"decode {op}: {exc.error_count()} invalid field(s)",
+            ) from exc
+
+    def _decode_list(
+        self, model: type[_M], data: Any, resp: httpx.Response, op: str
+    ) -> list[_M]:
+        if data is None:
+            return []
+        if not isinstance(data, list):
+            raise BonnieError(
+                op,
+                resp.status_code,
+                resp.text[:MAX_ERROR_BODY],
+                f"decode {op}: expected a list",
+            )
+        return [self._decode(model, item, resp, op) for item in data]
+
     # --- health, system, GPU ------------------------------------------------
 
     async def health(self) -> HealthReport:
+        """Fetch the agent's health report. A 2xx with a non-report body is a decode error."""
         resp = await self._request("GET", "/health", op="health", idempotent=True)
-        try:
-            return HealthReport.model_validate(resp.json())
-        except ValueError:
-            return HealthReport()
+        return self._decode(HealthReport, self._json(resp, "health"), resp, "health")
 
     async def system_info(self) -> SystemInfoResponse:
         resp = await self._request(
             "GET", "/api/v1/system/info", op="system info", idempotent=True
         )
-        return SystemInfoResponse.model_validate(self._json(resp, "system info"))
+        return self._decode(
+            SystemInfoResponse, self._json(resp, "system info"), resp, "system info"
+        )
 
     async def gpu_status(self) -> GPUSnapshot:
         resp = await self._request(
             "GET", "/api/v1/gpu/status", op="gpu status", idempotent=True
         )
-        return GPUSnapshot.model_validate(self._json(resp, "gpu status"))
+        return self._decode(
+            GPUSnapshot, self._json(resp, "gpu status"), resp, "gpu status"
+        )
 
     async def gpu_metrics(self) -> GPUMetrics:
         resp = await self._request(
@@ -265,8 +309,9 @@ class BonnieClient:
         resp = await self._request(
             "GET", "/api/v1/containers", op="list containers", idempotent=True
         )
-        data = self._json(resp, "list containers") or []
-        return [ContainerInfo.model_validate(item) for item in data]
+        return self._decode_list(
+            ContainerInfo, self._json(resp, "list containers"), resp, "list containers"
+        )
 
     async def inspect_container(self, container_id: str) -> dict[str, Any]:
         resp = await self._request(
@@ -376,14 +421,17 @@ class BonnieClient:
             timeout=self.fetch_timeout,
             retry_on_timeout=False,
         )
-        return ModelEntry.model_validate(self._json(resp, "fetch model"))
+        return self._decode(
+            ModelEntry, self._json(resp, "fetch model"), resp, "fetch model"
+        )
 
     async def list_models(self) -> list[ModelEntry]:
         resp = await self._request(
             "GET", "/api/v1/models", op="list models", idempotent=True
         )
-        data = self._json(resp, "list models") or []
-        return [ModelEntry.model_validate(item) for item in data]
+        return self._decode_list(
+            ModelEntry, self._json(resp, "list models"), resp, "list models"
+        )
 
     async def delete_model(self, model_id: str) -> None:
         await self._request(
@@ -411,7 +459,7 @@ class BonnieClient:
                     continue
                 try:
                     yield BenchmarkEvent.model_validate(payload)
-                except ValueError as exc:
+                except ValidationError as exc:
                     self._log.debug(
                         "bonnie: skipping malformed sse event: op=run benchmark error=%s",
                         exc,
@@ -449,6 +497,15 @@ class BonnieClient:
                 "run benchmark", None, "", "benchmark stream ended without result"
             )
         return result
+
+
+def _plaintext_remote(url: str) -> bool:
+    parts = urlsplit(url)
+    return parts.scheme == "http" and parts.hostname not in (
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    )
 
 
 def _try_json(text: str) -> Any:

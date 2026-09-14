@@ -232,7 +232,7 @@ async def test_has_online_agent() -> None:
     checker = BonnieAgentsChecker(reg)
     assert checker.name == "bonnie-agents"
     with pytest.raises(NoAgentsRegistered, match="no agents registered"):
-        checker.check()
+        await checker.check()
     await reg.upsert(_agent(1))
     with pytest.raises(NoOnlineAgents, match="no online agents"):
         reg.has_online_agent()
@@ -255,7 +255,82 @@ async def test_concurrent_access() -> None:
     assert len(reg.agents()) == 5
 
 
-def test_agent_defaults() -> None:
-    a = Agent(id="x", name="n", url="u")
-    assert a.status == STATUS_OFFLINE and a.token == ""
+def test_agent_defaults_and_repr_hides_token() -> None:
+    a = Agent(id="x", name="n", url="u", token="s3cret")
+    assert a.status == STATUS_OFFLINE and a.token == "s3cret"
+    assert "s3cret" not in repr(a) and "s3cret" not in str(a)
     assert datetime.now(timezone.utc).tzinfo is timezone.utc
+
+
+async def test_unhealthy_report_is_offline() -> None:
+    reg, made = _registry(None)
+    await reg.upsert(_agent(1))
+    client = made["http://h1:7777"]
+
+    async def unhealthy() -> HealthReport:
+        return HealthReport(healthy=False)
+
+    client.health = unhealthy
+    await reg.poll()
+    assert reg.agents()[0].status == STATUS_OFFLINE
+
+
+async def test_concurrent_start_creates_one_loop() -> None:
+    # FIX: two overlapping start() calls must not leak a second polling loop.
+    class SlowStore(FakeStore):
+        async def list(self) -> list[Agent]:
+            await asyncio.sleep(0.01)
+            return await super().list()
+
+    reg, _ = _registry(SlowStore([_agent(1)]), poll_interval=0.01)
+    await asyncio.gather(reg.start(), reg.start())
+    tasks = [t for t in asyncio.all_tasks() if t.get_name() == "bonnie-registry"]
+    assert len(tasks) == 1
+    await reg.stop()
+    await asyncio.sleep(0)
+    assert not [
+        t
+        for t in asyncio.all_tasks()
+        if t.get_name() == "bonnie-registry" and not t.done()
+    ]
+
+
+async def test_stop_propagates_caller_cancellation() -> None:
+    reg, _ = _registry(FakeStore([_agent(1)]), poll_interval=0.01)
+    await reg.start()
+
+    async def slow_close() -> None:
+        await asyncio.sleep(10)
+
+    made["http://h1:7777"].aclose = slow_close
+    stopper = asyncio.create_task(reg.stop())
+    await asyncio.sleep(0.01)
+    stopper.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stopper
+
+
+async def test_loop_survives_poll_and_reload_errors(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = FakeStore([_agent(1)])
+    reg, made = _registry(store, poll_interval=0.01, reload_interval=0.01)
+    await reg.start()
+    store.list_error = RuntimeError("db flake")
+    store.update_error = RuntimeError("db flake")
+    await asyncio.sleep(0.05)
+    assert reg._task is not None and not reg._task.done()
+    assert "reload failed" in caplog.text
+    await reg.stop()
+
+
+async def test_close_all_keeps_going_after_a_failure() -> None:
+    reg, made = _registry(FakeStore([_agent(1), _agent(2)]))
+    await reg.reload()
+
+    async def boom() -> None:
+        raise RuntimeError("close failed")
+
+    made["http://h1:7777"].aclose = boom
+    await reg.stop()
+    assert made["http://h2:7777"].closed

@@ -9,6 +9,7 @@ from flag_commons.bonnie.client import (
     DEFAULT_FETCH_TIMEOUT,
     DEFAULT_RETRIES,
     DEFAULT_TIMEOUT,
+    RETRY_AFTER_MAX,
     RETRYABLE_STATUSES,
     BonnieClient,
     backoff_delay,
@@ -54,13 +55,23 @@ from flag_commons.bonnie.registry import (
     RegistryError,
     RegistryStore,
 )
-from flag_commons.bonnie.sse import SSEFrame, demux_stdcopy, parse_sse
+from flag_commons.bonnie.sse import (
+    MAX_FRAME_BYTES,
+    MAX_LINE_BYTES,
+    SSEFrame,
+    SSEOverflow,
+    demux_stdcopy,
+    parse_sse,
+)
 
 __all__ = [
     "DEFAULT_FETCH_TIMEOUT",
     "DEFAULT_RETRIES",
     "DEFAULT_TIMEOUT",
+    "MAX_FRAME_BYTES",
+    "MAX_LINE_BYTES",
     "RETRYABLE_STATUSES",
+    "RETRY_AFTER_MAX",
     "STATUS_OFFLINE",
     "STATUS_ONLINE",
     "STATUS_UNAUTHORIZED",
@@ -96,6 +107,7 @@ __all__ = [
     "RegistryError",
     "RegistryStore",
     "SSEFrame",
+    "SSEOverflow",
     "SystemInfo",
     "SystemInfoResponse",
     "backoff_delay",

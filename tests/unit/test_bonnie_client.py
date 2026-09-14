@@ -11,6 +11,7 @@ import pytest
 import respx
 
 from flag_commons.bonnie import (
+    RETRY_AFTER_MAX,
     BenchmarkEvent,
     BenchmarkSpec,
     BonnieBadRequest,
@@ -92,9 +93,54 @@ async def test_health_ok(client: BonnieClient) -> None:
 
 
 @respx.mock
-async def test_health_non_json_body_is_still_ok(client: BonnieClient) -> None:
-    respx.get(f"{BASE}/health").mock(return_value=httpx.Response(200, text="ok"))
-    assert (await client.health()).healthy is True
+async def test_health_non_report_body_is_a_decode_error(client: BonnieClient) -> None:
+    # A captive portal or a different service answering 200 must not look healthy.
+    respx.get(f"{BASE}/health").mock(
+        return_value=httpx.Response(200, text="<html>ok</html>")
+    )
+    with pytest.raises(BonnieError, match="decode health"):
+        await client.health()
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("path", "method", "body"),
+    [
+        ("/api/v1/system/info", "system_info", {"system": "oops"}),
+        ("/api/v1/gpu/status", "gpu_status", ""),
+        ("/api/v1/containers", "list_containers", [{"name": "no-id"}]),
+        ("/api/v1/models", "list_models", {"m1": {}}),
+    ],
+)
+async def test_wrong_shape_bodies_are_typed_decode_errors(
+    client: BonnieClient, path: str, method: str, body: object
+) -> None:
+    respx.get(f"{BASE}{path}").mock(
+        return_value=httpx.Response(200, json=body)
+        if body != ""
+        else httpx.Response(200, text="")
+    )
+    with pytest.raises(BonnieError, match="decode"):
+        await getattr(client, method)()
+
+
+@respx.mock
+async def test_hostile_ids_are_percent_encoded(client: BonnieClient) -> None:
+    route = respx.get(f"{BASE}/api/v1/containers/..%2F..%2Fadmin%3Fx%3D1").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    await client.inspect_container("../../admin?x=1")
+    assert route.called
+
+
+def test_plaintext_remote_token_warns(caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="flag_commons.bonnie.client"):
+        BonnieClient("http://gpu-01:7777", "tok")
+        BonnieClient("http://127.0.0.1:7777", "tok")
+        BonnieClient("https://gpu-02:7777", "tok")
+    assert caplog.text.count("plaintext http") == 1
 
 
 @respx.mock
@@ -401,6 +447,50 @@ async def test_retry_network_errors_then_unavailable(client: BonnieClient) -> No
 
 
 @respx.mock
+async def test_retry_timeout_then_success(
+    client: BonnieClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Ordinary idempotent calls do retry on timeout (unlike fetch_model).
+    route = respx.get(f"{BASE}/health").mock(
+        side_effect=[httpx.ReadTimeout("slow"), httpx.Response(200, json={})]
+    )
+    await client.health()
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_exhausted_retries_log_a_warning(
+    client: BonnieClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    respx.get(f"{BASE}/health").mock(return_value=httpx.Response(503))
+    with (
+        caplog.at_level(logging.WARNING, logger="flag_commons.bonnie.client"),
+        pytest.raises(BonnieError),
+    ):
+        await client.health()
+    assert "failed after retries" in caplog.text and "attempts=3" in caplog.text
+
+
+@respx.mock
+async def test_stream_error_body_is_bounded(client: BonnieClient) -> None:
+    respx.get(f"{BASE}/api/v1/containers/c1/logs").mock(
+        return_value=httpx.Response(502, text="x" * 100_000)
+    )
+    with pytest.raises(BonnieError) as info:
+        async for _ in client.stream_container_logs("c1"):
+            pass
+    assert len(info.value.body) <= 4096
+
+
+def test_error_messages_are_sanitized() -> None:
+    err = BonnieError("op", 500, '{"error": "x\nINFO forged line\x1b[31m"}')
+    assert "\n" not in err.message and "\x1b" not in err.message
+    assert "forged line" in err.message
+
+
+@respx.mock
 async def test_retry_non_idempotent_not_retried(client: BonnieClient) -> None:
     # Go: TestRetry_NonIdempotentNotRetried
     route = respx.post(f"{BASE}/api/v1/containers").mock(
@@ -429,6 +519,7 @@ async def test_retry_4xx_not_retried(client: BonnieClient) -> None:
 def test_backoff_delay() -> None:
     assert backoff_delay(0, "7") == 7.0
     assert backoff_delay(0, "junk") <= 0.125
+    assert backoff_delay(0, "86400") == RETRY_AFTER_MAX  # FIX: server value is clamped
     for attempt, base in enumerate([0.1, 0.2, 0.4, 0.8, 1.6, 3.2, 5.0, 5.0]):
         d = backoff_delay(attempt)
         assert base * 0.75 <= d <= base * 1.25
@@ -522,7 +613,8 @@ async def test_run_benchmark(client: BonnieClient) -> None:
     )
     events: list[BenchmarkEvent] = []
     result = await client.run_benchmark(_spec(), events.append)
-    assert [e.type for e in events] == ["status", "result"]
+    # Unknown event types are forwarded (forward compatibility), malformed JSON is skipped.
+    assert [e.type for e in events] == ["status", "bogus", "result"]
     assert result.results == {"tps": 12.5} and result.duration_ms == 900
     respx.post(f"{BASE}/api/v1/benchmark").mock(
         return_value=_stream('data: {"type": "result", "phase": "benchmark"}\n\n')
