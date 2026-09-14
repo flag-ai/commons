@@ -6,7 +6,7 @@ authors = ["Kirizan"]
 license = "Apache-2.0"
 readme = "README.md"
 packages = [{include = "flag_commons", from = "src"}]
-include = ["src/flag_commons/py.typed"]
+include = ["src/flag_commons/py.typed", "src/flag_commons/install/script.sh"]
 
 [tool.poetry.dependencies]
 python = "^3.10"
