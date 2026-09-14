@@ -296,7 +296,7 @@ async def test_concurrent_start_creates_one_loop() -> None:
 
 
 async def test_stop_propagates_caller_cancellation() -> None:
-    reg, _ = _registry(FakeStore([_agent(1)]), poll_interval=0.01)
+    reg, made = _registry(FakeStore([_agent(1)]), poll_interval=0.01)
     await reg.start()
 
     async def slow_close() -> None:
