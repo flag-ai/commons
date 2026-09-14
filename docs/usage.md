@@ -36,8 +36,8 @@ from pydantic import SecretStr
 
 from flag_commons.bonnie import AgentRegistry, BonnieAgentsChecker
 from flag_commons.config import BaseConfig
-from flag_commons.database import DatabaseChecker, connect, run_migrations_async
-from flag_commons.health import Registry
+from flag_commons.database import connect, run_migrations_async
+from flag_commons.health import DatabaseChecker, Registry
 from flag_commons.health.fastapi import health_router
 from flag_commons.secrets import SecretsProvider, provider_from_env
 
