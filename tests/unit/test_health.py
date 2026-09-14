@@ -159,7 +159,10 @@ def test_report_json_matches_go_shape() -> None:
     report = Report(
         healthy=False,
         version="1.0.0 (commit: abc, built: today)",
-        checks=[Status("db", True, 3), Status("cache", False, 12, error="refused")],
+        checks=[
+            Status("db", True, 3, error=""),
+            Status("cache", False, 12, error="refused"),
+        ],
     )
     assert json.loads(json.dumps(report.to_dict())) == {
         "healthy": False,
@@ -176,6 +179,27 @@ def test_run_all_sync() -> None:
     reg.register(_Sync("db"))
     reg.register(_Async("api"))
     assert reg.run_all_sync().healthy
+
+
+def test_run_all_sync_returns_at_timeout_despite_hung_thread() -> None:
+    # A stuck sync check must not hold up the Flask worker calling us.
+    release = threading.Event()
+
+    class Hang:
+        name = "hang"
+
+        def check(self) -> None:
+            release.wait(5)
+
+    reg = _registry(timeout=0.1)
+    reg.register(Hang())
+    start = time.monotonic()
+    report = reg.run_all_sync()
+    elapsed = time.monotonic() - start
+    release.set()
+    assert not report.healthy
+    assert "timed out" in (report.checks[0].error or "")
+    assert elapsed < 2
 
 
 async def test_run_all_sync_inside_loop_is_an_error() -> None:
@@ -242,4 +266,19 @@ async def test_http_checker_injected_client() -> None:
     async with httpx.AsyncClient() as client:
         await HttpChecker("svc", "http://svc.test/", client=client).check()
     assert route.called
-    assert "svc.test" in repr(HttpChecker("svc", "http://svc.test/"))
+
+
+@respx.mock
+async def test_http_checker_follows_redirects_like_go() -> None:
+    respx.get("http://svc.test/old").mock(
+        return_value=httpx.Response(301, headers={"Location": "http://svc.test/new"})
+    )
+    respx.get("http://svc.test/new").mock(return_value=httpx.Response(200))
+    await HttpChecker("svc", "http://svc.test/old").check()
+
+
+def test_http_checker_repr_redacts_credentials_and_query() -> None:
+    text = repr(HttpChecker("svc", "https://user:pw@svc.test/health?token=abc"))
+    assert "pw" not in text and "token" not in text
+    assert "https://svc.test/health" in text
+    assert "invalid url" in repr(HttpChecker("svc", "not a url"))

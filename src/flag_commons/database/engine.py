@@ -12,6 +12,7 @@ from sqlalchemy import Engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.pool import QueuePool
 
 DEFAULT_POOL_SIZE = 10
 DEFAULT_MAX_OVERFLOW = 0
@@ -39,6 +40,7 @@ def normalize_url(url: str) -> str:
         parsed = make_url(url)
     except (ArgumentError, ValueError) as exc:
         raise DatabaseError(f"database: invalid connection string: {exc}") from exc
+    parsed = parsed.set(drivername=parsed.drivername.lower())
     if parsed.drivername in ("postgres", "postgresql"):
         parsed = parsed.set(drivername="postgresql+psycopg")
     elif parsed.drivername != "postgresql+psycopg":
@@ -56,11 +58,16 @@ def _engine_kwargs(
     extra: dict[str, Any],
 ) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
-        "pool_size": pool_size,
-        "max_overflow": max_overflow,
         "pool_recycle": pool_recycle,
         "pool_pre_ping": pool_pre_ping,
     }
+    poolclass = extra.get("poolclass")
+    # NullPool / StaticPool and friends reject queue sizing arguments.
+    if poolclass is None or (
+        isinstance(poolclass, type) and issubclass(poolclass, QueuePool)
+    ):
+        kwargs["pool_size"] = pool_size
+        kwargs["max_overflow"] = max_overflow
     kwargs.update(extra)
     return kwargs
 

@@ -23,12 +23,12 @@ class _Check:
             raise RuntimeError("down")
 
 
-def _client(*checks: _Check, critical: bool = True) -> TestClient:
+def _client(*checks: _Check, critical: bool = True, redact: bool = False) -> TestClient:
     reg = Registry(dist_name="flag-commons")
     for c in checks:
         reg.register(c, critical=critical)
     app = FastAPI()
-    app.include_router(health_router(reg))
+    app.include_router(health_router(reg, redact_errors=redact))
     return TestClient(app)
 
 
@@ -65,3 +65,13 @@ def test_dist_name_override() -> None:
     app = FastAPI()
     app.include_router(health_router(reg, dist_name="not-installed-dist"))
     assert TestClient(app).get("/health").json()["version"].startswith("dev (")
+
+
+def test_ready_redacts_errors_when_asked(caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="flag_commons.health.fastapi"):
+        resp = _client(_Check("db", False), redact=True).get("/ready")
+    assert resp.status_code == 503
+    assert resp.json()["checks"][0]["error"] == "check failed"
+    assert "error=down" in caplog.text

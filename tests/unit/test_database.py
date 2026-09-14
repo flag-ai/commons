@@ -9,9 +9,10 @@ from typing import cast
 import pytest
 from sqlalchemy import Engine
 from sqlalchemy.ext.asyncio import AsyncEngine
-from sqlalchemy.pool import QueuePool
+from sqlalchemy.pool import NullPool, QueuePool
 
 from flag_commons.database import (
+    MIGRATION_LOCK_KEY,
     DatabaseError,
     connect,
     connect_sync,
@@ -39,6 +40,7 @@ URL = "postgres://karr:pw@db.test:5432/karr"
             "postgresql+psycopg://u:p@h:5433/db?sslmode=require",
         ),
         ("postgresql+psycopg://u@h/db", "postgresql+psycopg://u@h/db"),
+        ("POSTGRES://u@h/db", "postgresql+psycopg://u@h/db"),
     ],
 )
 def test_normalize_url(given: str, expected: str) -> None:
@@ -223,3 +225,15 @@ async def test_run_migrations_async_delegates(
     )
     await run_migrations_async(tmp_path, URL, revision="base")
     assert calls == [(tmp_path, URL, "base")]
+
+
+def test_create_engine_with_nullpool() -> None:
+    engine = create_engine(URL, poolclass=NullPool)
+    assert isinstance(engine.pool, NullPool)
+    sync_engine = create_sync_engine(URL, poolclass=NullPool)
+    assert isinstance(sync_engine.pool, NullPool)
+
+
+def test_migration_lock_key_is_stable() -> None:
+    # Every FLAG Python service must agree on this key.
+    assert MIGRATION_LOCK_KEY == 38678575

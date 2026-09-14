@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import text
 
 from flag_commons.database import (
+    MIGRATION_LOCK_KEY,
     DatabaseError,
     connect,
     connect_sync,
@@ -85,9 +86,14 @@ def test_migrations_apply_and_are_idempotent(
                 == "0001"
             )
             conn.execute(text("SELECT id, name FROM flag_commons_it"))
-            # The advisory lock was released.
-            assert conn.execute(text("SELECT pg_try_advisory_lock(1)")).scalar() is True
-            conn.execute(text("SELECT pg_advisory_unlock(1)"))
+            # The migration lock itself was released.
+            got = conn.execute(
+                text("SELECT pg_try_advisory_lock(:k)"), {"k": MIGRATION_LOCK_KEY}
+            ).scalar()
+            assert got is True
+            conn.execute(
+                text("SELECT pg_advisory_unlock(:k)"), {"k": MIGRATION_LOCK_KEY}
+            )
     finally:
         with engine.begin() as conn:
             conn.execute(text("DROP TABLE IF EXISTS flag_commons_it"))
@@ -122,4 +128,45 @@ async def test_migrations_async_and_concurrent(
         with engine.begin() as conn:
             conn.execute(text("DROP TABLE IF EXISTS flag_commons_it"))
             conn.execute(text("DROP TABLE IF EXISTS alembic_version"))
+        engine.dispose()
+
+
+def test_lock_timeout_surfaces_as_error(
+    database_url: str, alembic_scripts: Path
+) -> None:
+    holder = create_sync_engine(database_url, pool_size=1)
+    try:
+        with holder.connect() as conn:
+            conn.execute(text("SELECT pg_advisory_lock(:k)"), {"k": MIGRATION_LOCK_KEY})
+            with pytest.raises(DatabaseError, match="migration lock"):
+                run_migrations(alembic_scripts, database_url, lock_timeout=0.2)
+            conn.execute(
+                text("SELECT pg_advisory_unlock(:k)"), {"k": MIGRATION_LOCK_KEY}
+            )
+    finally:
+        holder.dispose()
+
+
+def test_failed_migration_is_wrapped_and_lock_released(
+    database_url: str, tmp_path: Path
+) -> None:
+    scripts = tmp_path / "bad"
+    (scripts / "versions").mkdir(parents=True)
+    (scripts / "env.py").write_text("raise RuntimeError('env exploded')\n")
+    (scripts / "script.py.mako").write_text("")
+    with pytest.raises(DatabaseError, match="migration failed: env exploded"):
+        run_migrations(scripts, database_url)
+    engine = create_sync_engine(database_url)
+    try:
+        with engine.connect() as conn:
+            assert (
+                conn.execute(
+                    text("SELECT pg_try_advisory_lock(:k)"), {"k": MIGRATION_LOCK_KEY}
+                ).scalar()
+                is True
+            )
+            conn.execute(
+                text("SELECT pg_advisory_unlock(:k)"), {"k": MIGRATION_LOCK_KEY}
+            )
+    finally:
         engine.dispose()

@@ -61,7 +61,7 @@ jobs:
         image: postgres:17-alpine
         env:
           POSTGRES_USER: flag
-          POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD || 'flag-ci' }}
+          POSTGRES_PASSWORD: flag-ci  # job-local throwaway service container
           POSTGRES_DB: flag_test
         ports: ["5432:5432"]
         options: >-
@@ -79,7 +79,7 @@ jobs:
         run: poetry install --with dev --extras all
       - name: Run integration tests
         env:
-          TEST_DATABASE_URL: postgresql://flag:${{ secrets.TEST_POSTGRES_PASSWORD || 'flag-ci' }}@localhost:5432/flag_test
+          TEST_DATABASE_URL: postgresql://flag:flag-ci@localhost:5432/flag_test
         run: poetry run pytest tests/integration -v
 
   security:

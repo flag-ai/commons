@@ -25,6 +25,7 @@ from flag_commons.database.engine import (
     ping_sync,
 )
 from flag_commons.database.migrations import (
+    DEFAULT_LOCK_TIMEOUT,
     MIGRATION_LOCK_KEY,
     run_migrations,
     run_migrations_async,
@@ -32,8 +33,12 @@ from flag_commons.database.migrations import (
 
 __all__ = [
     "DEFAULT_CONNECT_RETRIES",
+    "DEFAULT_LOCK_TIMEOUT",
+    "DEFAULT_MAX_OVERFLOW",
     "DEFAULT_POOL_RECYCLE",
     "DEFAULT_POOL_SIZE",
+    "DEFAULT_RETRY_BASE_DELAY",
+    "DEFAULT_RETRY_MAX_DELAY",
     "MIGRATION_LOCK_KEY",
     "DatabaseError",
     "connect",

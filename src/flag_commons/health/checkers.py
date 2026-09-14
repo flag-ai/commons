@@ -30,7 +30,12 @@ class DatabaseChecker:
 
 
 class HttpChecker:
-    """GETs ``url`` and expects a 2xx response."""
+    """GETs ``url`` and expects a 2xx response.
+
+    Redirects are followed, as Go's default ``http.Client`` did. Only the
+    status line is read; the body is never buffered. When a ``client`` is
+    injected, ``timeout`` is still applied per request.
+    """
 
     def __init__(
         self,
@@ -49,20 +54,27 @@ class HttpChecker:
         if self._client is not None:
             await self._request(self._client)
             return
-        async with httpx.AsyncClient(
-            timeout=self.timeout, follow_redirects=False
-        ) as client:
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
             await self._request(client)
 
     async def _request(self, client: httpx.AsyncClient) -> None:
         try:
-            resp = await client.get(self.url)
+            async with client.stream(
+                "GET", self.url, timeout=self.timeout, follow_redirects=True
+            ) as resp:
+                status = resp.status_code
         except httpx.HTTPError as exc:
             raise RuntimeError(f"health: request to {self.name} failed: {exc}") from exc
-        if not 200 <= resp.status_code < 300:
-            raise RuntimeError(
-                f"health: {self.name} returned status {resp.status_code}"
-            )
+        if not 200 <= status < 300:
+            raise RuntimeError(f"health: {self.name} returned status {status}")
 
     def __repr__(self) -> str:
-        return f"HttpChecker(name={self.name!r}, url={self.url!r})"
+        try:
+            url = httpx.URL(self.url)
+        except httpx.InvalidURL:
+            url = None
+        if url is None or not url.host:
+            safe = "<invalid url>"
+        else:
+            safe = f"{url.scheme}://{url.host}{url.path}"
+        return f"HttpChecker(name={self.name!r}, url={safe!r})"

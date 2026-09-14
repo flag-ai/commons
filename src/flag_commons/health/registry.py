@@ -7,12 +7,23 @@ import inspect
 import threading
 import time
 from collections.abc import Awaitable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 from flag_commons import version as flag_version
 
 DEFAULT_CHECK_TIMEOUT = 5.0
+DEFAULT_SYNC_WORKERS = 8
+
+# Sync checks run on this dedicated, bounded executor rather than the event
+# loop's default one. Two reasons: a hung check cannot starve unrelated
+# asyncio.to_thread() users (database pings, migrations), and asyncio.run()
+# never joins this executor, so run_all_sync() returns as soon as the
+# timeout fires instead of waiting for the stuck thread.
+_SYNC_EXECUTOR = ThreadPoolExecutor(
+    max_workers=DEFAULT_SYNC_WORKERS, thread_name_prefix="flag-health"
+)
 
 
 @runtime_checkable
@@ -41,7 +52,7 @@ class Status:
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"name": self.name, "healthy": self.healthy}
-        if self.error is not None:
+        if self.error:  # Go: omitempty
             out["error"] = self.error
         out["latency_ms"] = self.latency_ms
         if not self.critical:
@@ -142,14 +153,10 @@ class Registry:
 
 
 async def _invoke(checker: Checker) -> None:
-    result = (
-        await asyncio.to_thread(checker.check)
-        if not _is_async(checker)
-        else checker.check()
-    )
-    if inspect.isawaitable(result):
+    if inspect.iscoroutinefunction(checker.check):
+        await checker.check()
+        return
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(_SYNC_EXECUTOR, checker.check)
+    if inspect.isawaitable(result):  # a plain function that returned a coroutine
         await result
-
-
-def _is_async(checker: Checker) -> bool:
-    return inspect.iscoroutinefunction(checker.check)
