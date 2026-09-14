@@ -9,7 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from flag_commons.config import BaseConfig, ConfigError, load_base, parse_listen_addr
-from flag_commons.secrets import EnvProvider
+from flag_commons.secrets import EnvProvider, SecretsBackendError
 
 
 @pytest.fixture
@@ -26,7 +26,7 @@ def test_load_base_success_with_defaults(clean_env: pytest.MonkeyPatch) -> None:
     assert cfg.component == "karr"
     assert cfg.log_level == "info"
     assert cfg.log_format == "text"
-    assert cfg.database_url == "postgres://localhost/flagdb"
+    assert cfg.database_url.get_secret_value() == "postgres://localhost/flagdb"
     assert cfg.listen_addr == ":8080"
 
 
@@ -59,7 +59,7 @@ def test_load_base_empty_database_url_rejected(clean_env: pytest.MonkeyPatch) ->
 
 def test_load_base_database_optional(clean_env: pytest.MonkeyPatch) -> None:
     cfg = load_base("bonnie", EnvProvider(), require_database=False)
-    assert cfg.database_url == ""
+    assert cfg.database_url.get_secret_value() == ""
 
 
 def test_load_base_empty_component(clean_env: pytest.MonkeyPatch) -> None:
@@ -97,7 +97,7 @@ def test_subclass_reads_extra_keys(clean_env: pytest.MonkeyPatch) -> None:
 def test_config_is_frozen_and_forbids_extras() -> None:
     cfg = BaseConfig(component="x")
     with pytest.raises(ValidationError):
-        cfg.component = "y"  # type: ignore[misc]
+        cfg.component = "y"
     with pytest.raises(ValidationError):
         BaseConfig(component="x", unknown=1)  # type: ignore[call-arg]
 
@@ -121,3 +121,28 @@ def test_bind_address(addr: str, expected: tuple[str, int]) -> None:
 def test_bind_address_invalid(addr: str) -> None:
     with pytest.raises(ConfigError):
         parse_listen_addr(addr)
+
+
+def test_database_url_never_leaks(clean_env: pytest.MonkeyPatch) -> None:
+    clean_env.setenv("DATABASE_URL", "postgresql://flag:sup3rs3cr3t@db/karr")
+    cfg = load_base("karr", EnvProvider())
+    assert "sup3rs3cr3t" not in repr(cfg)
+    assert "sup3rs3cr3t" not in cfg.model_dump_json()
+    assert cfg.database_url.get_secret_value().endswith("@db/karr")
+
+
+def test_backend_error_becomes_config_error(clean_env: pytest.MonkeyPatch) -> None:
+    class Broken:
+        def get(self, key: str) -> str:
+            raise SecretsBackendError("openbao down")
+
+        def get_or_default(self, key: str, default: str) -> str:
+            return default
+
+    with pytest.raises(ConfigError, match="openbao down"):
+        load_base("karr", Broken())
+
+
+def test_component_must_not_be_empty() -> None:
+    with pytest.raises(ValidationError):
+        BaseConfig(component="")

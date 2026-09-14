@@ -113,9 +113,8 @@ def _record_fields(record: logging.LogRecord) -> dict[str, Any]:
 
 
 def _timestamp(record: logging.LogRecord) -> str:
-    return datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(
-        timespec="milliseconds"
-    )
+    stamp = datetime.fromtimestamp(record.created, tz=timezone.utc)
+    return stamp.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 class _BaseFormatter(logging.Formatter):
@@ -133,7 +132,10 @@ class _BaseFormatter(logging.Formatter):
             "version": self.version,
             "logger": record.name,
         }
-        out.update(_record_fields(record))
+        # Caller-supplied fields never overwrite the trusted base fields;
+        # a colliding key is prefixed instead so it stays visible.
+        for key, value in _record_fields(record).items():
+            out[key if key not in out else f"attr_{key}"] = value
         if record.exc_info and record.exc_info[1] is not None:
             out["exception"] = self.formatException(record.exc_info)
         elif record.exc_text:
@@ -160,7 +162,8 @@ class TextFormatter(_BaseFormatter):
 
     def format(self, record: logging.LogRecord) -> str:
         return " ".join(
-            f"{key}={_quote(value)}" for key, value in self.fields(record).items()
+            f"{_quote(key)}={_quote(value)}"
+            for key, value in self.fields(record).items()
         )
 
 
@@ -178,12 +181,17 @@ def setup_logging(
     fmt: str = FORMAT_TEXT,
     stream: TextIO = sys.stderr,
     dist_name: str | None = None,
+    force: bool = True,
 ) -> Logger:
     """Configure the root logger and return the component's logger.
 
-    Calling it again replaces the handler installed by the previous call, so
-    tests and re-configuration are safe. ``dist_name`` is the distribution
-    whose version is stamped on every record; it defaults to ``component``.
+    With ``force=True`` (the default) every existing root handler is removed,
+    including ones installed by ``logging.basicConfig`` or a framework, so
+    records are emitted exactly once. With ``force=False`` only the handler
+    installed by a previous call is replaced. ``dist_name`` is the
+    distribution whose version is stamped on every record; it defaults to
+    ``component``. When uvicorn is given :func:`uvicorn_log_config`, call this
+    after uvicorn has configured logging.
     """
     version = flag_version.get_version(dist_name or component)
     handler = logging.StreamHandler(stream)
@@ -193,7 +201,7 @@ def setup_logging(
 
     root = logging.getLogger()
     for existing in list(root.handlers):
-        if getattr(existing, _HANDLER_TAG, False):
+        if force or getattr(existing, _HANDLER_TAG, False):
             root.removeHandler(existing)
             existing.close()
     root.addHandler(handler)

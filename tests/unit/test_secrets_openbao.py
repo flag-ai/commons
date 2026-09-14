@@ -229,3 +229,34 @@ def test_sends_vault_token_header() -> None:
         OpenBaoProvider(ADDR, "tok").get("p")
         assert route.calls[0].request.headers["X-Vault-Token"] == "tok"
         assert json.loads(route.calls[0].response.text)["data"]["data"]["value"] == "v"
+
+
+@pytest.mark.parametrize(
+    "key", ["../../sys/seal", "a/../../v1/sys/mounts", "/abs/path", "a//b", "./a"]
+)
+def test_parse_key_rejects_traversal(key: str) -> None:
+    # FIX: slashes are real path separators now, so dot segments must be refused.
+    with pytest.raises(SecretsError, match="path"):
+        parse_key(key)
+
+
+def test_parse_key_allows_nested_paths() -> None:
+    assert parse_key("infra/karr/db#password") == ("infra/karr/db", "password")
+
+
+def test_context_manager_closes_client() -> None:
+    client = httpx.Client()
+    with OpenBaoProvider(ADDR, "t", client=client) as p:
+        assert p.addr == ADDR
+    assert client.is_closed
+
+
+def test_default_client_does_not_follow_redirects() -> None:
+    with respx.mock:
+        respx.get(f"{ADDR}/v1/kv/data/p").mock(
+            return_value=httpx.Response(
+                302, headers={"Location": "http://evil.test/steal"}
+            )
+        )
+        with pytest.raises(SecretsBackendError, match="302"):
+            OpenBaoProvider(ADDR, "tok").get("p")

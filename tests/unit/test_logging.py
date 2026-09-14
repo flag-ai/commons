@@ -163,3 +163,45 @@ def test_uvicorn_log_config_propagates() -> None:
     for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
         assert cfg["loggers"][name]["propagate"] is True
         assert cfg["loggers"][name]["level"] == logging.DEBUG
+
+
+def test_extra_cannot_forge_base_fields() -> None:
+    buf, logger = _setup("json")
+    logger.error(
+        "real failure", extra={"level": "DEBUG", "component": "spoofed", "time": "1999"}
+    )
+    record = json.loads(buf.getvalue())
+    assert record["level"] == "ERROR"
+    assert record["component"] == "test-svc"
+    assert record["attr_level"] == "DEBUG"
+    assert record["attr_component"] == "spoofed"
+
+
+def test_text_quotes_keys() -> None:
+    buf, logger = _setup("text")
+    logger.info("x", extra={"evil=1 forged": "y"})
+    assert '"evil=1 forged"=y' in buf.getvalue()
+
+
+def test_timestamp_is_rfc3339_utc() -> None:
+    buf, logger = _setup("json")
+    logger.info("x")
+    stamp = json.loads(buf.getvalue())["time"]
+    assert stamp.endswith("Z")
+    assert "+00:00" not in stamp
+
+
+def test_force_removes_foreign_handlers() -> None:
+    foreign = logging.StreamHandler(io.StringIO())
+    logging.getLogger().addHandler(foreign)
+    buf, logger = _setup("json")
+    logger.info("once")
+    assert foreign not in logging.getLogger().handlers
+    assert buf.getvalue().count("\n") == 1
+
+
+def test_force_false_keeps_foreign_handlers() -> None:
+    foreign = logging.StreamHandler(io.StringIO())
+    logging.getLogger().addHandler(foreign)
+    flag_logging.setup_logging("svc", stream=io.StringIO(), force=False)
+    assert foreign in logging.getLogger().handlers

@@ -2228,4 +2228,4 @@ postgres = ["alembic", "psycopg", "sqlalchemy"]
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.10"
-content-hash = "dc097586fe0c137426d24f7b0ba0b6f80f218cd0a5795c12efa3b0c0ac75f8b2"
+content-hash = "abe7b7bb9865d638283a20838f112ca1d8bc72349ea1a3114e648097307792e2"

@@ -1,9 +1,9 @@
 # FLAG Commons
 
 Shared Python library for the FLAG (Foundation for Local AI Governance) platform.
-Provides the foundational contracts used by FLAG components: version info,
-structured logging, secrets, configuration, database access, health checks and
-the BONNIE agent client.
+It provides the foundational contracts used by FLAG components. On this branch
+the `version`, `logging`, `secrets` and `config` packages are ported; `health`,
+`database`, `bonnie` and `install` follow in later PRs of the rewrite.
 
 > **Rewrite in progress.** This tree replaces the Go library, which is preserved
 > at tag `go-final-v0.2.1` (identical to `v0.2.1`). Go module consumers must keep
@@ -13,7 +13,7 @@ the BONNIE agent client.
 
 ```toml
 [tool.poetry.dependencies]
-flag-commons = {git = "https://github.com/flag-ai/commons", tag = "v0.3.0", extras = ["postgres", "fastapi"]}
+flag-commons = {git = "https://github.com/flag-ai/commons", tag = "v0.3.0"}
 ```
 
 ## Development

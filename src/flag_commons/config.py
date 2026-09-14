@@ -11,6 +11,8 @@ Differences from Go, on purpose:
 * An empty ``DATABASE_URL`` is rejected when the database is required.
 * ``require_database=False`` exists for components without a database
   (BONNIE could not use ``LoadBase`` at all).
+* ``database_url`` is a :class:`pydantic.SecretStr`; call
+  ``cfg.database_url.get_secret_value()`` to read it.
 """
 
 from __future__ import annotations
@@ -18,10 +20,10 @@ from __future__ import annotations
 import sys
 from typing import Any, TextIO
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from flag_commons import logging as flag_logging
-from flag_commons.secrets import SecretNotFoundError, SecretsProvider
+from flag_commons.secrets import SecretsError, SecretsProvider
 
 DEFAULT_LOG_LEVEL = "info"
 DEFAULT_LOG_FORMAT = "text"
@@ -37,10 +39,10 @@ class BaseConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    component: str
+    component: str = Field(min_length=1)
     log_level: str = DEFAULT_LOG_LEVEL
     log_format: str = DEFAULT_LOG_FORMAT
-    database_url: str = ""
+    database_url: SecretStr = SecretStr("")
     listen_addr: str = DEFAULT_LISTEN_ADDR
 
     @staticmethod
@@ -55,14 +57,18 @@ class BaseConfig(BaseModel):
         Subclasses call this and add their own keys::
 
             class KarrConfig(BaseConfig):
-                admin_token: str
+                admin_token: SecretStr
 
                 @classmethod
                 def load(cls, provider):
                     return cls(
                         **cls.base_fields("karr", provider),
-                        admin_token=provider.get("KARR_ADMIN_TOKEN"),
+                        admin_token=SecretStr(provider.get("KARR_ADMIN_TOKEN")),
                     )
+
+        Secrets are typed :class:`pydantic.SecretStr` so ``repr()`` and
+        ``model_dump()`` never leak them; read them with
+        ``.get_secret_value()`` at the point of use.
         """
         if not component:
             raise ConfigError("config: component name is required")
@@ -70,7 +76,7 @@ class BaseConfig(BaseModel):
         if require_database:
             try:
                 database_url = provider.get("DATABASE_URL")
-            except SecretNotFoundError as exc:
+            except SecretsError as exc:
                 raise ConfigError(f"config: DATABASE_URL is required: {exc}") from exc
             if not database_url:
                 raise ConfigError("config: DATABASE_URL is required: value is empty")
@@ -81,7 +87,7 @@ class BaseConfig(BaseModel):
             "component": component,
             "log_level": provider.get_or_default("LOG_LEVEL", DEFAULT_LOG_LEVEL),
             "log_format": provider.get_or_default("LOG_FORMAT", DEFAULT_LOG_FORMAT),
-            "database_url": database_url,
+            "database_url": SecretStr(database_url),
             "listen_addr": provider.get_or_default("LISTEN_ADDR", DEFAULT_LISTEN_ADDR),
         }
 

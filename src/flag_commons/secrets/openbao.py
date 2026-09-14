@@ -35,12 +35,29 @@ def parse_key(key: str) -> tuple[str, str]:
         raise SecretsError("secrets: empty key")
     path, sep, field = key.partition("#")
     if not sep:
-        return key, DEFAULT_FIELD
+        field = DEFAULT_FIELD
     if path == "":
         raise SecretsError(f"secrets: empty path in key {key!r}")
     if field == "":
         raise SecretsError(f"secrets: empty field in key {key!r}")
+    _validate_path(path, key)
     return path, field
+
+
+def _validate_path(path: str, key: str) -> None:
+    """Reject paths that could escape the KV mount.
+
+    Go used ``url.PathEscape``, which turned ``/`` into ``%2F`` and so could
+    never traverse. Keeping real slashes (nested KV paths) means dot segments
+    and absolute paths have to be refused explicitly.
+    """
+    if path.startswith("/"):
+        raise SecretsError(f"secrets: absolute path in key {key!r}")
+    for segment in path.split("/"):
+        if segment in ("", ".", ".."):
+            raise SecretsError(
+                f"secrets: invalid path segment {segment!r} in key {key!r}"
+            )
 
 
 class OpenBaoProvider:
@@ -50,6 +67,10 @@ class OpenBaoProvider:
     ``X-Vault-Token`` header; the value is ``data.data[field]`` and must be a
     string. Values are cached in memory for ``cache_ttl`` seconds (``0``
     disables the cache); errors are never cached.
+
+    The default client does not follow redirects, so the token can never be
+    forwarded to another host. An injected ``client`` should keep that
+    setting.
     """
 
     def __init__(
@@ -67,7 +88,7 @@ class OpenBaoProvider:
         self.mount = mount.strip("/")
         self.cache_ttl = cache_ttl
         self._token = token
-        self._client = client or httpx.Client(timeout=timeout)
+        self._client = client or httpx.Client(timeout=timeout, follow_redirects=False)
         self._log = logger or _log
         self._lock = threading.Lock()
         self._cache: dict[str, tuple[str, float]] = {}
@@ -77,6 +98,12 @@ class OpenBaoProvider:
 
     def close(self) -> None:
         self._client.close()
+
+    def __enter__(self) -> OpenBaoProvider:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
     def get(self, key: str) -> str:
         path, field = parse_key(key)

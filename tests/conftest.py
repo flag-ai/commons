@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 
 import pytest
 
 
 @pytest.fixture(autouse=True)
-def _reset_root_logging() -> None:
-    """Remove handlers our setup_logging installed so tests stay isolated."""
-    yield  # type: ignore[misc]
+def _reset_root_logging() -> Iterator[None]:
+    """Restore the root logger so tests stay isolated from setup_logging."""
     root = logging.getLogger()
+    saved_handlers = list(root.handlers)
+    saved_level = root.level
+    yield
     for handler in list(root.handlers):
-        if getattr(handler, "_flag_commons_handler", False):
+        if handler not in saved_handlers:
             root.removeHandler(handler)
             handler.close()
-    root.setLevel(logging.WARNING)
+    for handler in saved_handlers:
+        if handler not in root.handlers:
+            root.addHandler(handler)
+    root.setLevel(saved_level)
